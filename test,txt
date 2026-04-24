@@ -1,0 +1,32 @@
+ Open the app and login:
+  http://localhost:3000
+  - Click "Fill Demo Credentials" button
+  - Click "Sign In"
+
+  2. Test each AI feature:
+  ┌─────────────────┬────────────────────────────┬────────────────────────────────────────────────────────────┐
+  │     Feature     │       Menu Location        │                        How to Test                         │
+  ├─────────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ AI Sentiment    │ Sidebar → "AI Sentiment"   │ Click any row → Click "Analyze with AI" button in the form │
+  ├─────────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ AI Journey Map  │ Sidebar → "AI Journeys"    │ Click any row → Click "Map Journey with AI" button         │
+  ├─────────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ AI Win-Back     │ Sidebar → "AI Win-Back"    │ Click any row → Click "Generate with AI" button            │
+  ├─────────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ AI Health Score │ Sidebar → "AI Health"      │ Click any row → Click "Calculate Health with AI" button    │
+  ├─────────────────┼────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ AI Escalations  │ Sidebar → "AI Escalations" │ Click any row → Click "Predict Escalation with AI" button  │
+  └─────────────────┴────────────────────────────┴────────────────────────────────────────────────────────────┘
+  3. Or use Dashboard Quick Actions:
+  - Go to Dashboard (home icon)
+  - Scroll down to "AI Features" section
+  - Click any of the gradient-colored buttons to navigate directly
+
+  4. Testing the click handlers:
+  - On Dashboard, click any stat card (Total Customers, Alerts, etc.)
+  - Click any chart (Customer Distribution, Risk Distribution, etc.)
+  - Click any row in the Top At-Risk table
+
+  Each should navigate to the appropriate page.
+
+  Note: The AI buttons require the OpenRouter API key in your .env file to work. Let me verify it's configured:
