@@ -8,6 +8,14 @@ import GenericList from './components/GenericList';
 import Dashboard from './components/Dashboard';
 import AIReports from './components/AIReports';
 import ErrorBoundary from './components/ErrorBoundary';
+import CohortSurvival from './components/CohortSurvival';
+import InterventionPerformance from './components/InterventionPerformance';
+import ChurnTriggers from './components/ChurnTriggers';
+import WinbackOrchestration from './components/WinbackOrchestration';
+import FeatureCorrelation from './components/FeatureCorrelation';
+import CompetitorIntel from './components/CompetitorIntel';
+import ForecastConfidence from './components/ForecastConfidence';
+import BatchInterventions from './components/BatchInterventions';
 import api, { API_URL } from './api';
 
 // Auth Context
@@ -503,6 +511,14 @@ function Layout({ children }) {
     { path: '/service-levels', label: 'AI Service Level', icon: '⏱️' },
     { path: '/response-suggestions', label: 'AI Response', icon: '💡' },
     { path: '/ai-reports', label: 'AI Reports', icon: '🤖' },
+    { path: '/cohort-survival', label: 'Cohort Survival', icon: '📅' },
+    { path: '/intervention-performance', label: 'Intervention Performance', icon: '📊' },
+    { path: '/churn-triggers', label: 'Churn Triggers', icon: '🚨' },
+    { path: '/winback-orchestration', label: 'Win-Back Orchestrator', icon: '🎯' },
+    { path: '/feature-correlation', label: 'Feature Correlation', icon: '🔗' },
+    { path: '/competitor-intel', label: 'Competitor Intel', icon: '🕵️' },
+    { path: '/forecast-confidence', label: 'Forecast Confidence', icon: '📈' },
+    { path: '/batch-interventions', label: 'Batch Scheduling', icon: '📆' },
     { path: '/profile', label: 'User Profile', icon: '👤' },
   ];
 
@@ -2800,6 +2816,14 @@ function App() {
                       <Route path="/service-levels" element={<ServiceLevels />} />
                       <Route path="/response-suggestions" element={<ResponseSuggestions />} />
                       <Route path="/ai-reports" element={<AIReports />} />
+                      <Route path="/cohort-survival" element={<CohortSurvival />} />
+                      <Route path="/intervention-performance" element={<InterventionPerformance />} />
+                      <Route path="/churn-triggers" element={<ChurnTriggers />} />
+                      <Route path="/winback-orchestration" element={<WinbackOrchestration />} />
+                      <Route path="/feature-correlation" element={<FeatureCorrelation />} />
+                      <Route path="/competitor-intel" element={<CompetitorIntel />} />
+                      <Route path="/forecast-confidence" element={<ForecastConfidence />} />
+                      <Route path="/batch-interventions" element={<BatchInterventions />} />
                     </Routes>
                   </Layout>
                 ) : (

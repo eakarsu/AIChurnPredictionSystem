@@ -13,8 +13,35 @@ require('dotenv').config({ path: '../.env' });
 const app = express();
 const PORT = process.env.BACKEND_PORT || 3001;
 
-// Token blacklist for logout
-const tokenBlacklist = new Set();
+// ============ DB-BACKED TOKEN BLACKLIST SETUP ============
+// Initializes the token_blacklist table if it doesn't exist.
+// Falls back to an in-memory Set if the DB is unavailable at startup.
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS token_blacklist (
+        token TEXT PRIMARY KEY,
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires ON token_blacklist (expires_at)`);
+    console.log('Token blacklist table ready');
+  } catch (err) {
+    console.error('Could not create token_blacklist table:', err.message);
+  }
+})();
+
+// Periodically purge expired tokens from the DB blacklist (every 30 minutes)
+setInterval(async () => {
+  try {
+    const result = await pool.query('DELETE FROM token_blacklist WHERE expires_at < NOW()');
+    if (result.rowCount > 0) {
+      console.log(`Purged ${result.rowCount} expired tokens from blacklist`);
+    }
+  } catch (err) {
+    console.error('Token blacklist purge error:', err.message);
+  }
+}, 30 * 60 * 1000);
 
 // ============ SECURITY MIDDLEWARE ============
 
@@ -47,6 +74,16 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many authentication attempts, please try again later' }
+});
+
+// Rate limiting - AI endpoints (10 req/15min per IP to prevent abuse and runaway costs)
+const aiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+  message: { error: 'AI rate limit exceeded. Maximum 10 AI requests per 15 minutes per IP.' }
 });
 
 // Input sanitization middleware
@@ -100,7 +137,7 @@ const validatePasswordStrength = (password) => {
 };
 
 // JWT Authentication Middleware
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -108,9 +145,18 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  // Check token blacklist (logout)
-  if (tokenBlacklist.has(token)) {
-    return res.status(401).json({ error: 'Token has been revoked' });
+  // Check DB-backed token blacklist (logout)
+  try {
+    const blacklisted = await pool.query(
+      'SELECT 1 FROM token_blacklist WHERE token = $1 AND expires_at > NOW()',
+      [token]
+    );
+    if (blacklisted.rows.length > 0) {
+      return res.status(401).json({ error: 'Token has been revoked' });
+    }
+  } catch (err) {
+    console.error('Token blacklist check error:', err.message);
+    // On DB error, fall through and let JWT verification decide
   }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
@@ -307,13 +353,24 @@ app.post('/api/auth/verify-email', async (req, res) => {
 });
 
 // ============ LOGOUT ============
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
-  tokenBlacklist.add(req.token);
-  // Clean old tokens periodically (tokens expire after 24h anyway)
-  if (tokenBlacklist.size > 10000) {
-    tokenBlacklist.clear();
+app.post('/api/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    // Decode token to get expiry so we can set expires_at in the blacklist
+    const decoded = jwt.decode(req.token);
+    const expiresAt = decoded && decoded.exp
+      ? new Date(decoded.exp * 1000)
+      : new Date(Date.now() + 24 * 60 * 60 * 1000); // fallback: 24h from now
+
+    await pool.query(
+      'INSERT INTO token_blacklist (token, expires_at) VALUES ($1, $2) ON CONFLICT (token) DO NOTHING',
+      [req.token, expiresAt]
+    );
+    res.json({ message: 'Logged out successfully' });
+  } catch (err) {
+    console.error('Logout DB error:', err.message);
+    // Even on DB error, return success — the JWT will naturally expire
+    res.json({ message: 'Logged out successfully' });
   }
-  res.json({ message: 'Logged out successfully' });
 });
 
 // ============ FORGOT PASSWORD ============
@@ -1649,7 +1706,75 @@ app.get('/api/export/pdf/:entity', authenticateToken, async (req, res) => {
   }
 });
 
+// ============ AI HELPER: GRACEFUL DEGRADATION WRAPPER ============
+/**
+ * Calls the OpenRouter API with automatic graceful degradation.
+ * On any network/API error returns { fallback: true, ...fallbackData }.
+ * @param {string[]} messages  - Array of {role, content} message objects
+ * @param {object}  fallbackData - Structured fallback to return when AI is unavailable
+ * @returns {{ data: object|null, elapsed: number, fallback: boolean, rawContent: string|null }}
+ */
+const callOpenRouterAI = async (messages, fallbackData = {}) => {
+  const startTime = Date.now();
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'http://localhost:3000',
+        'X-Title': 'Churn Prediction System'
+      },
+      body: JSON.stringify({
+        model: process.env.OPENROUTER_MODEL,
+        messages
+      })
+    });
+
+    const elapsed = Date.now() - startTime;
+
+    if (!response.ok) {
+      console.error(`OpenRouter HTTP error: ${response.status} ${response.statusText}`);
+      return { data: null, elapsed, fallback: true, rawContent: null, fallbackData };
+    }
+
+    const aiResult = await response.json();
+
+    if (aiResult.error) {
+      console.error('OpenRouter API error:', aiResult.error);
+      return { data: null, elapsed, fallback: true, rawContent: null, fallbackData };
+    }
+
+    const rawContent = aiResult.choices?.[0]?.message?.content || null;
+    if (!rawContent) {
+      console.error('OpenRouter returned empty content');
+      return { data: null, elapsed, fallback: true, rawContent: null, fallbackData };
+    }
+
+    // Strip markdown code fences if present
+    let cleaned = rawContent.trim();
+    if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
+    else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
+    if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
+    cleaned = cleaned.trim();
+
+    try {
+      const parsed = JSON.parse(cleaned);
+      return { data: parsed, elapsed, fallback: false, rawContent };
+    } catch (parseErr) {
+      console.error('OpenRouter JSON parse error:', parseErr.message, '| raw:', rawContent.substring(0, 200));
+      return { data: null, elapsed, fallback: true, rawContent, fallbackData };
+    }
+  } catch (networkErr) {
+    const elapsed = Date.now() - startTime;
+    console.error('OpenRouter network error:', networkErr.message);
+    return { data: null, elapsed, fallback: true, rawContent: null, fallbackData };
+  }
+};
+
 // ============ AI ROUTES (OpenRouter) ============
+// Apply AI-specific rate limiter to all /api/ai/* routes
+app.use('/api/ai/', aiLimiter);
 
 app.post('/api/ai/analyze-churn', authenticateToken, async (req, res) => {
   try {
@@ -1695,68 +1820,40 @@ Provide:
 Format as JSON with keys: risk_score, factors, interventions, confidence`;
 
     console.log('Calling OpenRouter API...');
-    const startTime = Date.now();
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are an AI analyst specializing in customer churn prediction. Respond only with valid JSON.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
-
-    const elapsed = Date.now() - startTime;
-    console.log(`OpenRouter response received in ${elapsed}ms, status: ${response.status}`);
-
-    const aiResult = await response.json();
-    console.log('OpenRouter response:', JSON.stringify(aiResult).substring(0, 500));
-
-    if (aiResult.error) {
-      console.error('OpenRouter API error:', aiResult.error);
-      return res.status(500).json({ error: 'OpenRouter API error', details: aiResult.error });
-    }
-
-    const analysis = aiResult.choices?.[0]?.message?.content;
-
-    if (!analysis) {
-      console.error('No content in OpenRouter response');
-      return res.status(500).json({ error: 'No response from AI', details: aiResult });
-    }
-
-    let parsedAnalysis;
-    try {
-      // Clean the response - remove markdown code blocks if present
-      let cleanedAnalysis = analysis.trim();
-      if (cleanedAnalysis.startsWith('```json')) {
-        cleanedAnalysis = cleanedAnalysis.slice(7);
+    const { data: parsedAnalysis, elapsed, fallback, rawContent } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are an AI analyst specializing in customer churn prediction. Respond only with valid JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      {
+        risk_score: 50,
+        factors: ['AI temporarily unavailable — manual review recommended'],
+        interventions: ['Contact customer directly for assessment'],
+        confidence: 0
       }
-      if (cleanedAnalysis.startsWith('```')) {
-        cleanedAnalysis = cleanedAnalysis.slice(3);
-      }
-      if (cleanedAnalysis.endsWith('```')) {
-        cleanedAnalysis = cleanedAnalysis.slice(0, -3);
-      }
-      parsedAnalysis = JSON.parse(cleanedAnalysis.trim());
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError.message);
-      console.error('Raw analysis:', analysis);
-      return res.status(500).json({ error: 'Failed to parse AI response', raw: analysis });
+    );
+
+    console.log(`OpenRouter response received in ${elapsed}ms, fallback=${fallback}`);
+
+    if (fallback || !parsedAnalysis) {
+      return res.json({
+        customer_id,
+        customer_name: customer.name,
+        risk_score: 50,
+        factors: ['AI temporarily unavailable — manual review recommended'],
+        interventions: ['Contact customer directly for assessment'],
+        confidence: 0,
+        ai_unavailable: true,
+        response_time_ms: elapsed
+      });
     }
 
     res.json({
       customer_id,
       customer_name: customer.name,
       ...parsedAnalysis,
-      raw_analysis: analysis,
+      raw_analysis: rawContent,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
     });
@@ -1794,57 +1891,26 @@ Provide 3 specific, actionable interventions with:
 Format as JSON array with keys: type, description, priority, effectiveness`;
 
     console.log('Calling OpenRouter for intervention suggestions...');
-    const startTime = Date.now();
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a customer success expert. Respond only with valid JSON array.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const fallbackSuggestions = [
+      { type: 'Outreach Call', description: 'Schedule a check-in call to understand current challenges', priority: 'High', effectiveness: 70 }
+    ];
 
-    const elapsed = Date.now() - startTime;
-    console.log(`OpenRouter response in ${elapsed}ms, status: ${response.status}`);
+    const { data: parsedSuggestions, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a customer success expert. Respond only with valid JSON array.' },
+        { role: 'user', content: prompt }
+      ],
+      fallbackSuggestions
+    );
 
-    const aiResult = await response.json();
-
-    if (aiResult.error) {
-      console.error('OpenRouter API error:', aiResult.error);
-      return res.status(500).json({ error: 'OpenRouter API error', details: aiResult.error });
-    }
-
-    const suggestions = aiResult.choices?.[0]?.message?.content;
-
-    if (!suggestions) {
-      return res.status(500).json({ error: 'No response from AI', details: aiResult });
-    }
-
-    let parsedSuggestions;
-    try {
-      let cleaned = suggestions.trim();
-      if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
-      if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
-      if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
-      parsedSuggestions = JSON.parse(cleaned.trim());
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError.message);
-      return res.status(500).json({ error: 'Failed to parse AI response', raw: suggestions });
-    }
+    console.log(`OpenRouter response in ${elapsed}ms, fallback=${fallback}`);
 
     res.json({
       customer_id,
       customer_name: customer.name,
-      suggestions: parsedSuggestions,
+      suggestions: (fallback || !parsedSuggestions) ? fallbackSuggestions : parsedSuggestions,
+      ai_unavailable: fallback || !parsedSuggestions,
       response_time_ms: elapsed
     });
   } catch (error) {
@@ -1876,37 +1942,22 @@ Provide:
 
 Format as JSON with keys: health_assessment, characteristics, strategies, risks, opportunities`;
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a market analyst specializing in customer segmentation. Respond only with valid JSON.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const { data: parsedAnalysis, elapsed: segElapsed, fallback: segFallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a market analyst specializing in customer segmentation. Respond only with valid JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      { health_assessment: 'AI temporarily unavailable', characteristics: [], strategies: [], risks: [], opportunities: [] }
+    );
 
-    const aiResult = await response.json();
-    const analysis = aiResult.choices?.[0]?.message?.content || '{}';
-
-    let parsedAnalysis;
-    try {
-      parsedAnalysis = JSON.parse(analysis);
-    } catch {
-      parsedAnalysis = { health_assessment: "Unable to analyze", characteristics: [], strategies: [], risks: [], opportunities: [] };
-    }
+    const analysis = parsedAnalysis || { health_assessment: 'AI temporarily unavailable', characteristics: [], strategies: [], risks: [], opportunities: [] };
 
     res.json({
       segment_id,
       segment_name: segment.name,
-      ...parsedAnalysis
+      ...analysis,
+      ai_unavailable: segFallback || !parsedAnalysis,
+      response_time_ms: segElapsed
     });
   } catch (error) {
     console.error('AI segment analysis error:', error);
@@ -1943,45 +1994,30 @@ Provide:
 
 Format as JSON with keys: projected_loss_3mo, projected_loss_6mo, projected_loss_12mo, severity, priority_actions, confidence`;
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a financial analyst specializing in SaaS revenue forecasting. Respond only with valid JSON.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const revenueFallback = {
+      projected_loss_3mo: atRiskRevenue * 0.3,
+      projected_loss_6mo: atRiskRevenue * 0.5,
+      projected_loss_12mo: atRiskRevenue * 0.7,
+      severity: 'AI unavailable — estimated from data',
+      priority_actions: ['Manual review required'],
+      confidence: 0
+    };
 
-    const aiResult = await response.json();
-    const analysis = aiResult.choices?.[0]?.message?.content || '{}';
-
-    let parsedAnalysis;
-    try {
-      parsedAnalysis = JSON.parse(analysis);
-    } catch {
-      parsedAnalysis = {
-        projected_loss_3mo: atRiskRevenue * 0.3,
-        projected_loss_6mo: atRiskRevenue * 0.5,
-        projected_loss_12mo: atRiskRevenue * 0.7,
-        severity: "Unknown",
-        priority_actions: ["Manual review required"],
-        confidence: 0
-      };
-    }
+    const { data: parsedAnalysis, elapsed: revElapsed, fallback: revFallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a financial analyst specializing in SaaS revenue forecasting. Respond only with valid JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      revenueFallback
+    );
 
     res.json({
       total_revenue: totalRevenue,
       at_risk_revenue: atRiskRevenue,
       at_risk_customers: customers.filter(c => parseFloat(c.prediction_score || 0) > 50).length,
-      ...parsedAnalysis
+      ...(parsedAnalysis || revenueFallback),
+      ai_unavailable: revFallback || !parsedAnalysis,
+      response_time_ms: revElapsed
     });
   } catch (error) {
     console.error('AI revenue prediction error:', error);
@@ -2017,37 +2053,22 @@ Create a comprehensive report with:
 
 Format as JSON with keys: summary, metrics, risk_assessment, recommendations, action_items`;
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a business intelligence analyst. Generate professional reports. Respond only with valid JSON.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const reportFallback = { summary: 'AI temporarily unavailable — report generation skipped', metrics: {}, risk_assessment: '', recommendations: [], action_items: [] };
 
-    const aiResult = await response.json();
-    const report = aiResult.choices?.[0]?.message?.content || '{}';
-
-    let parsedReport;
-    try {
-      parsedReport = JSON.parse(report);
-    } catch {
-      parsedReport = { summary: "Report generation failed", metrics: {}, risk_assessment: "", recommendations: [], action_items: [] };
-    }
+    const { data: parsedReport, elapsed: rptElapsed, fallback: rptFallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a business intelligence analyst. Generate professional reports. Respond only with valid JSON.' },
+        { role: 'user', content: prompt }
+      ],
+      reportFallback
+    );
 
     res.json({
       report_type,
       generated_at: new Date().toISOString(),
-      ...parsedReport
+      ...(parsedReport || reportFallback),
+      ai_unavailable: rptFallback || !parsedReport,
+      response_time_ms: rptElapsed
     });
   } catch (error) {
     console.error('AI report generation error:', error);
@@ -2131,37 +2152,16 @@ Provide risk assessment as JSON with:
 - contributing_factors: array of 3-5 specific factors
 - recommended_actions: array of 3-5 specific actions`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a risk assessment expert. Respond only with valid JSON object.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a risk assessment expert. Respond only with valid JSON object.' },
+        { role: 'user', content: prompt }
+      ],
+      { risk_level: 'Unknown', score: 50, category: 'Unavailable', contributing_factors: ['AI temporarily unavailable'], recommended_actions: ['Manual risk review required'] }
+    );
 
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) {
-      return res.status(500).json({ error: 'Failed to parse AI response' });
+    if (fallback || !parsed) {
+      return res.json({ risk_level: 'Unknown', score: 50, category: 'Unavailable', contributing_factors: ['AI temporarily unavailable'], recommended_actions: ['Manual risk review required'], customer_name: customer.name, ai_unavailable: true, response_time_ms: elapsed });
     }
 
     res.json({ ...parsed, customer_name: customer.name, response_time_ms: elapsed });
@@ -2196,47 +2196,23 @@ Analyze their overall health and provide detailed scores as JSON (0-100 scale):
 
 Enterprise customers typically show higher scores. Consider revenue level when scoring.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a customer health analyst. Respond only with valid JSON object.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
-
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) {
-      return res.status(500).json({ error: 'Failed to parse AI response' });
-    }
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a customer health analyst. Respond only with valid JSON object.' },
+        { role: 'user', content: prompt }
+      ],
+      {}
+    );
 
     const result = {
-      overall_health: parsed.overall_health || parsed.overallHealth || parsed.health_score || 75,
-      product_usage: parsed.product_usage || parsed.productUsage || 70,
-      customer_satisfaction: parsed.customer_satisfaction || parsed.customerSatisfaction || 72,
-      growth_potential: parsed.growth_potential || parsed.growthPotential || 65,
-      support_health: parsed.support_health || parsed.supportHealth || 80,
-      financial_health: parsed.financial_health || parsed.financialHealth || 85,
-      trend: parsed.trend || 'stable',
+      overall_health: parsed?.overall_health || parsed?.overallHealth || parsed?.health_score || 75,
+      product_usage: parsed?.product_usage || parsed?.productUsage || 70,
+      customer_satisfaction: parsed?.customer_satisfaction || parsed?.customerSatisfaction || 72,
+      growth_potential: parsed?.growth_potential || parsed?.growthPotential || 65,
+      support_health: parsed?.support_health || parsed?.supportHealth || 80,
+      financial_health: parsed?.financial_health || parsed?.financialHealth || 85,
+      trend: parsed?.trend || 'stable',
+      ai_unavailable: fallback || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2270,45 +2246,21 @@ Analyze their engagement patterns and provide detailed scores as JSON (0-100 sca
 
 Higher tier plans should show higher engagement. Consider their revenue when scoring - high-paying customers are typically more engaged.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are an engagement analyst. Respond only with valid JSON object.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
-
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) {
-      return res.status(500).json({ error: 'Failed to parse AI response' });
-    }
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are an engagement analyst. Respond only with valid JSON object.' },
+        { role: 'user', content: prompt }
+      ],
+      {}
+    );
 
     const result = {
-      overall_score: parsed.overall_score || parsed.overallScore || parsed.score || 75,
-      login_frequency: parsed.login_frequency || parsed.loginFrequency || 60,
-      feature_adoption: parsed.feature_adoption || parsed.featureAdoption || 50,
-      support_interaction: parsed.support_interaction || parsed.supportInteraction || 40,
-      feedback_score: parsed.feedback_score || parsed.feedbackScore || 55,
+      overall_score: parsed?.overall_score || parsed?.overallScore || parsed?.score || 75,
+      login_frequency: parsed?.login_frequency || parsed?.loginFrequency || 60,
+      feature_adoption: parsed?.feature_adoption || parsed?.featureAdoption || 50,
+      support_interaction: parsed?.support_interaction || parsed?.supportInteraction || 40,
+      feedback_score: parsed?.feedback_score || parsed?.feedbackScore || 55,
+      ai_unavailable: fallback || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2346,49 +2298,20 @@ Provide ticket details as JSON:
 - assigned_to: suggested team (e.g., "Technical Support", "Billing Team", "Product Team")`;
 
     console.log('Calling OpenRouter for ticket analysis...');
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a support ticket analyst. Respond only with valid JSON object.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
 
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
+    const ticketFallback = { subject: subject || 'Support Request', description: description || 'Customer support request', priority: 'Medium', category: 'General', suggested_resolution: 'Manual review required', estimated_impact: 'Medium', assigned_to: 'Support Team' };
+
+    const { data: parsed, elapsed, fallback: ticketFallback2 } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a support ticket analyst. Respond only with valid JSON object.' },
+        { role: 'user', content: prompt }
+      ],
+      ticketFallback
+    );
+
     console.log('AI Ticket Response received:', elapsed, 'ms');
 
-    if (aiResult.error) {
-      console.error('AI API error:', aiResult.error);
-      return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    }
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      console.log('Raw AI content:', content.substring(0, 200));
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-      console.log('Parsed ticket analysis:', parsed);
-    } catch (e) {
-      console.error('JSON parse error:', e.message);
-      console.error('Content was:', aiResult.choices?.[0]?.message?.content);
-      return res.status(500).json({ error: 'Failed to parse AI response', raw: aiResult.choices?.[0]?.message?.content });
-    }
-
-    res.json({ ...parsed, customer_name: customer.name, response_time_ms: elapsed });
+    res.json({ ...(parsed || ticketFallback), ai_unavailable: ticketFallback2 || !parsed, customer_name: customer.name, response_time_ms: elapsed });
   } catch (error) {
     console.error('AI ticket analysis error:', error);
     res.status(500).json({ error: 'Server error', details: error.message });
@@ -2413,40 +2336,17 @@ Provide alert as JSON:
 - message: detailed alert message (2-3 sentences)
 - recommended_action: what to do about it`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'http://localhost:3000',
-        'X-Title': 'Churn Prediction System'
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: 'You are a customer alert system. Respond only with valid JSON object.' },
-          { role: 'user', content: prompt }
-        ]
-      })
-    });
+    const alertFallback = { alert_type: 'General Risk', severity: 'medium', message: 'AI alert generation temporarily unavailable. Manual review recommended.', recommended_action: 'Review customer account manually' };
 
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
+    const { data: parsed, elapsed, fallback: alertFb } = await callOpenRouterAI(
+      [
+        { role: 'system', content: 'You are a customer alert system. Respond only with valid JSON object.' },
+        { role: 'user', content: prompt }
+      ],
+      alertFallback
+    );
 
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) {
-      return res.status(500).json({ error: 'Failed to parse AI response' });
-    }
-
-    res.json({ ...parsed, customer_name: customer.name, response_time_ms: elapsed });
+    res.json({ ...(parsed || alertFallback), ai_unavailable: alertFb || !parsed, customer_name: customer.name, response_time_ms: elapsed });
   } catch (error) {
     console.error('AI alert suggestion error:', error);
     res.status(500).json({ error: 'Server error' });
@@ -2474,34 +2374,22 @@ Based on the company name and email domain, provide comprehensive recommendation
 
 Be specific and realistic based on the company name and domain.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer success expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: custFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer success expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const signupDate = new Date().toISOString().split('T')[0];
     const result = {
-      name: parsed.name || name || 'New Customer',
-      email: parsed.email || email || '',
-      company: parsed.company || company || '',
-      plan: parsed.plan || 'Professional',
-      monthly_revenue: parsed.monthly_revenue || parsed.monthlyRevenue || 500,
-      signup_date: parsed.signup_date || parsed.signupDate || signupDate,
-      status: parsed.status || 'active',
-      risk_assessment: parsed.risk_assessment || parsed.riskAssessment || '',
+      name: parsed?.name || name || 'New Customer',
+      email: parsed?.email || email || '',
+      company: parsed?.company || company || '',
+      plan: parsed?.plan || 'Professional',
+      monthly_revenue: parsed?.monthly_revenue || parsed?.monthlyRevenue || 500,
+      signup_date: parsed?.signup_date || parsed?.signupDate || signupDate,
+      status: parsed?.status || 'active',
+      risk_assessment: parsed?.risk_assessment || parsed?.riskAssessment || (custFb ? 'AI temporarily unavailable — manual assessment required' : ''),
+      ai_unavailable: custFb || !parsed,
       response_time_ms: elapsed
     };
     res.json(result);
@@ -2532,32 +2420,20 @@ Generate a comprehensive NPS analysis as JSON with:
 
 Consider their plan level and revenue when determining satisfaction.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are an NPS analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
-    // Calculate today's date for survey_date
+    const { data: parsed, elapsed, fallback: npsFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are an NPS analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
+
     const surveyDate = new Date().toISOString().split('T')[0];
 
     const result = {
-      score: parsed.score || parsed.nps_score || parsed.npsScore || 7,
-      category: parsed.category || 'Passive',
-      feedback: parsed.feedback || parsed.suggested_feedback || feedback || 'Customer feedback collected via survey',
-      survey_date: parsed.survey_date || parsed.surveyDate || surveyDate,
-      follow_up_required: parsed.follow_up_required || parsed.followUpRequired || false,
+      score: parsed?.score || parsed?.nps_score || parsed?.npsScore || 7,
+      category: parsed?.category || 'Passive',
+      feedback: parsed?.feedback || parsed?.suggested_feedback || feedback || 'Customer feedback collected via survey',
+      survey_date: parsed?.survey_date || parsed?.surveyDate || surveyDate,
+      follow_up_required: parsed?.follow_up_required || parsed?.followUpRequired || false,
+      ai_unavailable: npsFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2588,38 +2464,20 @@ Based on this customer's profile, provide a realistic behavior event as JSON wit
 Be specific and creative based on the customer's plan level and company type.`;
 
     console.log('Calling AI for behavior...');
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a behavior analyst. Respond only with valid JSON object.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    console.log('AI Behavior raw response:', JSON.stringify(aiResult).substring(0, 500));
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      console.log('AI Behavior content:', content);
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-      console.log('AI Behavior parsed:', parsed);
-    } catch (e) {
-      console.error('AI Behavior parse error:', e.message);
-      return res.status(500).json({ error: 'Failed to parse AI response' });
-    }
-    // Generate a session ID
+
+    const { data: parsed, elapsed, fallback: behavFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a behavior analyst. Respond only with valid JSON object.' }, { role: 'user', content: prompt }],
+      {}
+    );
+
     const sessionId = `SES-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    // Ensure exact field names are returned
     const result = {
-      event_type: parsed.event_type || parsed.eventType || parsed.type || 'page_view',
-      page_visited: parsed.page_visited || parsed.pageVisited || parsed.page || '/dashboard',
-      action_taken: parsed.action_taken || parsed.actionTaken || parsed.action || 'viewed page',
-      session_id: parsed.session_id || parsed.sessionId || sessionId,
+      event_type: parsed?.event_type || parsed?.eventType || parsed?.type || 'page_view',
+      page_visited: parsed?.page_visited || parsed?.pageVisited || parsed?.page || '/dashboard',
+      action_taken: parsed?.action_taken || parsed?.actionTaken || parsed?.action || 'viewed page',
+      session_id: parsed?.session_id || parsed?.sessionId || sessionId,
+      ai_unavailable: behavFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2652,34 +2510,22 @@ Based on this customer's profile and plan level, provide a realistic usage metri
 
 Be specific and provide realistic values based on the customer's revenue and plan tier.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a metrics analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
-    // Calculate period dates (last 30 days)
+    const { data: parsed, elapsed, fallback: metFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a metrics analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
+
     const periodEnd = new Date().toISOString().split('T')[0];
     const periodStart = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     const result = {
-      metric_name: parsed.metric_name || parsed.metricName || parsed.name || 'Monthly Active Users',
-      metric_value: parsed.metric_value || parsed.metricValue || parsed.value || 100,
-      period_start: parsed.period_start || parsed.periodStart || periodStart,
-      period_end: parsed.period_end || parsed.periodEnd || periodEnd,
-      trend: parsed.trend || 'stable',
-      comparison_value: parsed.comparison_value || parsed.comparisonValue || parsed.benchmark || 80,
+      metric_name: parsed?.metric_name || parsed?.metricName || parsed?.name || 'Monthly Active Users',
+      metric_value: parsed?.metric_value || parsed?.metricValue || parsed?.value || 100,
+      period_start: parsed?.period_start || parsed?.periodStart || periodStart,
+      period_end: parsed?.period_end || parsed?.periodEnd || periodEnd,
+      trend: parsed?.trend || 'stable',
+      comparison_value: parsed?.comparison_value || parsed?.comparisonValue || parsed?.benchmark || 80,
+      ai_unavailable: metFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2712,36 +2558,24 @@ Create a realistic billing record as JSON with:
 
 Base the amount on their monthly revenue and plan level.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a billing analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
-    // Calculate billing dates
+    const { data: parsed, elapsed, fallback: billFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a billing analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
+
     const today = new Date();
     const billingDate = today.toISOString().split('T')[0];
     const dueDate = new Date(today.setDate(today.getDate() + 30)).toISOString().split('T')[0];
 
     const result = {
-      invoice_number: parsed.invoice_number || parsed.invoiceNumber || `INV-${Date.now()}`,
-      amount: parsed.amount || customer.monthly_revenue || 100,
-      currency: parsed.currency || 'USD',
-      status: parsed.status || 'pending',
-      payment_method: parsed.payment_method || parsed.paymentMethod || 'Credit Card',
-      billing_date: parsed.billing_date || parsed.billingDate || billingDate,
-      due_date: parsed.due_date || parsed.dueDate || dueDate,
+      invoice_number: parsed?.invoice_number || parsed?.invoiceNumber || `INV-${Date.now()}`,
+      amount: parsed?.amount || customer.monthly_revenue || 100,
+      currency: parsed?.currency || 'USD',
+      status: parsed?.status || 'pending',
+      payment_method: parsed?.payment_method || parsed?.paymentMethod || 'Credit Card',
+      billing_date: parsed?.billing_date || parsed?.billingDate || billingDate,
+      due_date: parsed?.due_date || parsed?.dueDate || dueDate,
+      ai_unavailable: billFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2773,31 +2607,19 @@ Based on their plan level, suggest a realistic feature usage record as JSON with
 
 Higher tier plans should show more advanced feature usage.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a feature analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: featFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a feature analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
     const lastUsed = new Date().toISOString().slice(0, 16);
     const result = {
-      feature_name: parsed.feature_name || parsed.featureName || parsed.name || 'Dashboard',
-      usage_count: parsed.usage_count || parsed.usageCount || 50,
-      adoption_rate: parsed.adoption_rate || parsed.adoptionRate || 75,
-      time_spent_minutes: parsed.time_spent_minutes || parsed.timeSpentMinutes || 30,
-      last_used: parsed.last_used || parsed.lastUsed || lastUsed,
-      period: parsed.period || 'monthly',
+      feature_name: parsed?.feature_name || parsed?.featureName || parsed?.name || 'Dashboard',
+      usage_count: parsed?.usage_count || parsed?.usageCount || 50,
+      adoption_rate: parsed?.adoption_rate || parsed?.adoptionRate || 75,
+      time_spent_minutes: parsed?.time_spent_minutes || parsed?.timeSpentMinutes || 30,
+      last_used: parsed?.last_used || parsed?.lastUsed || lastUsed,
+      period: parsed?.period || 'monthly',
+      ai_unavailable: featFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2830,37 +2652,24 @@ Create a realistic session record as JSON with:
 
 Enterprise customers typically have longer, more engaged sessions.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a session analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
-    // Calculate session start and end times
+    const { data: parsed, elapsed, fallback: sessFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a session analyst. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
     const now = new Date();
     const sessionStart = now.toISOString().slice(0, 16);
-    const durationMins = parsed.duration_minutes || parsed.durationMinutes || 25;
+    const durationMins = parsed?.duration_minutes || parsed?.durationMinutes || 25;
     const sessionEnd = new Date(now.getTime() + durationMins * 60000).toISOString().slice(0, 16);
 
     const result = {
-      session_start: parsed.session_start || parsed.sessionStart || sessionStart,
-      session_end: parsed.session_end || parsed.sessionEnd || sessionEnd,
+      session_start: parsed?.session_start || parsed?.sessionStart || sessionStart,
+      session_end: parsed?.session_end || parsed?.sessionEnd || sessionEnd,
       duration_minutes: durationMins,
-      pages_viewed: parsed.pages_viewed || parsed.pagesViewed || 8,
-      actions_taken: parsed.actions_taken || parsed.actionsTaken || 15,
-      device_type: parsed.device_type || parsed.deviceType || 'Desktop',
-      browser: parsed.browser || 'Chrome',
+      pages_viewed: parsed?.pages_viewed || parsed?.pagesViewed || 8,
+      actions_taken: parsed?.actions_taken || parsed?.actionsTaken || 15,
+      device_type: parsed?.device_type || parsed?.deviceType || 'Desktop',
+      browser: parsed?.browser || 'Chrome',
+      ai_unavailable: sessFb || !parsed,
       customer_name: customer.name,
       response_time_ms: elapsed
     };
@@ -2885,29 +2694,17 @@ Generate a comprehensive segment definition as JSON with:
 
 Make the description actionable and the criteria specific.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a segmentation expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: segFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a segmentation expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
     const result = {
-      description: parsed.description || `${name || 'Customer'} segment based on specified criteria`,
-      criteria: parsed.criteria || { plan: 'Enterprise' },
-      customer_count: parsed.customer_count || parsed.customerCount || 50,
-      avg_revenue: parsed.avg_revenue || parsed.avgRevenue || 5000,
-      churn_rate: parsed.churn_rate || parsed.churnRate || 5.5,
+      description: parsed?.description || `${name || 'Customer'} segment based on specified criteria`,
+      criteria: parsed?.criteria || { plan: 'Enterprise' },
+      customer_count: parsed?.customer_count || parsed?.customerCount || 50,
+      avg_revenue: parsed?.avg_revenue || parsed?.avgRevenue || 5000,
+      churn_rate: parsed?.churn_rate || parsed?.churnRate || 5.5,
+      ai_unavailable: segFb || !parsed,
       response_time_ms: elapsed
     };
     res.json(result);
@@ -3008,34 +2805,21 @@ Provide comprehensive sentiment analysis as JSON with:
 
 Be thorough and identify subtle churn indicators.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a sentiment analysis expert specializing in customer churn prediction. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: sentFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a sentiment analysis expert specializing in customer churn prediction. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const result = {
-      sentiment_score: parsed.sentiment_score || 50,
-      sentiment_label: parsed.sentiment_label || 'Neutral',
-      churn_signal_strength: parsed.churn_signal_strength || 30,
-      key_phrases: parsed.key_phrases || [],
-      emotions: parsed.emotions || {},
-      urgency_level: parsed.urgency_level || 'Medium',
-      recommended_action: parsed.recommended_action || 'Monitor customer engagement',
-      feedback_summary: parsed.feedback_summary || '',
+      sentiment_score: parsed?.sentiment_score || 50,
+      sentiment_label: parsed?.sentiment_label || 'Neutral',
+      churn_signal_strength: parsed?.churn_signal_strength || 30,
+      key_phrases: parsed?.key_phrases || [],
+      emotions: parsed?.emotions || {},
+      urgency_level: parsed?.urgency_level || 'Medium',
+      recommended_action: parsed?.recommended_action || 'Monitor customer engagement',
+      feedback_summary: parsed?.feedback_summary || (sentFb ? 'AI temporarily unavailable' : ''),
+      ai_unavailable: sentFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3146,36 +2930,23 @@ Generate a new journey touchpoint analysis as JSON with:
 
 Be realistic based on the customer's current status and history.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer journey mapping expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: journeyFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer journey mapping expert. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const result = {
-      journey_stage: parsed.journey_stage || 'Active',
-      touchpoint_type: parsed.touchpoint_type || 'Product',
-      touchpoint_name: parsed.touchpoint_name || 'Regular Usage',
+      journey_stage: parsed?.journey_stage || 'Active',
+      touchpoint_type: parsed?.touchpoint_type || 'Product',
+      touchpoint_name: parsed?.touchpoint_name || 'Regular Usage',
       touchpoint_date: new Date().toISOString(),
-      sentiment_at_touchpoint: parsed.sentiment_at_touchpoint || 'Neutral',
-      engagement_level: parsed.engagement_level || 50,
-      is_churn_indicator: parsed.is_churn_indicator || false,
-      days_before_churn: parsed.days_before_churn || null,
-      journey_path: parsed.journey_path || { path: ['Active'] },
-      ai_insights: parsed.ai_insights || 'Standard customer engagement observed.',
+      sentiment_at_touchpoint: parsed?.sentiment_at_touchpoint || 'Neutral',
+      engagement_level: parsed?.engagement_level || 50,
+      is_churn_indicator: parsed?.is_churn_indicator || false,
+      days_before_churn: parsed?.days_before_churn || null,
+      journey_path: parsed?.journey_path || { path: ['Active'] },
+      ai_insights: parsed?.ai_insights || (journeyFb ? 'AI temporarily unavailable.' : 'Standard customer engagement observed.'),
+      ai_unavailable: journeyFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3288,36 +3059,23 @@ Generate a compelling win-back campaign as JSON with:
 
 Make it highly personalized based on their history and plan level.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer retention marketing expert. Create compelling, personalized win-back campaigns. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: winbackFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer retention marketing expert. Create compelling, personalized win-back campaigns. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const result = {
-      campaign_name: parsed.campaign_name || `Win-Back ${customer.name}`,
-      campaign_type: parsed.campaign_type || 'Personalized',
-      offer_type: parsed.offer_type || 'Discount',
-      offer_details: parsed.offer_details || 'Special return offer',
-      discount_percentage: parsed.discount_percentage || 20,
-      personalization_score: parsed.personalization_score || 75,
-      predicted_success_rate: parsed.predicted_success_rate || 40,
-      email_subject: parsed.email_subject || `${customer.name}, we want you back`,
-      email_body: parsed.email_body || 'We miss having you as a customer...',
-      key_selling_points: parsed.key_selling_points || [],
+      campaign_name: parsed?.campaign_name || `Win-Back ${customer.name}`,
+      campaign_type: parsed?.campaign_type || 'Personalized',
+      offer_type: parsed?.offer_type || 'Discount',
+      offer_details: parsed?.offer_details || 'Special return offer',
+      discount_percentage: parsed?.discount_percentage || 20,
+      personalization_score: parsed?.personalization_score || 75,
+      predicted_success_rate: parsed?.predicted_success_rate || 40,
+      email_subject: parsed?.email_subject || `${customer.name}, we want you back`,
+      email_body: parsed?.email_body || (winbackFb ? 'AI temporarily unavailable. Please compose a personalized message manually.' : 'We miss having you as a customer...'),
+      key_selling_points: parsed?.key_selling_points || [],
+      ai_unavailable: winbackFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3441,39 +3199,26 @@ Provide comprehensive health analysis as JSON with:
 
 Be specific and actionable in your recommendations.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer health analytics expert. Provide comprehensive, data-driven health assessments. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: healthDashFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer health analytics expert. Provide comprehensive, data-driven health assessments. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const result = {
-      health_score: parsed.health_score || 50,
-      engagement_index: parsed.engagement_index || 50,
-      satisfaction_index: parsed.satisfaction_index || 50,
-      financial_health: parsed.financial_health || 50,
-      product_adoption: parsed.product_adoption || 50,
-      support_sentiment: parsed.support_sentiment || 50,
-      risk_indicators: parsed.risk_indicators || { items: [] },
-      positive_signals: parsed.positive_signals || { items: [] },
-      trend_direction: parsed.trend_direction || 'stable',
-      trend_percentage: parsed.trend_percentage || 0,
-      last_activity_days: parsed.last_activity_days || 0,
-      recommended_actions: parsed.recommended_actions || [],
-      ai_summary: parsed.ai_summary || 'Health analysis completed.',
+      health_score: parsed?.health_score || 50,
+      engagement_index: parsed?.engagement_index || 50,
+      satisfaction_index: parsed?.satisfaction_index || 50,
+      financial_health: parsed?.financial_health || 50,
+      product_adoption: parsed?.product_adoption || 50,
+      support_sentiment: parsed?.support_sentiment || 50,
+      risk_indicators: parsed?.risk_indicators || { items: [] },
+      positive_signals: parsed?.positive_signals || { items: [] },
+      trend_direction: parsed?.trend_direction || 'stable',
+      trend_percentage: parsed?.trend_percentage || 0,
+      last_activity_days: parsed?.last_activity_days || 0,
+      recommended_actions: parsed?.recommended_actions || [],
+      ai_summary: parsed?.ai_summary || (healthDashFb ? 'AI temporarily unavailable. Manual health review recommended.' : 'Health analysis completed.'),
+      ai_unavailable: healthDashFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3590,36 +3335,23 @@ Predict escalation risk as JSON with:
 
 Be proactive in identifying subtle frustration signals.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer experience expert specializing in de-escalation and frustration detection. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: escalFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer experience expert specializing in de-escalation and frustration detection. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     const result = {
-      frustration_score: parsed.frustration_score || 30,
-      escalation_probability: parsed.escalation_probability || 20,
-      frustration_indicators: parsed.frustration_indicators || [],
-      recent_issues: parsed.recent_issues || { issues: [] },
-      communication_sentiment: parsed.communication_sentiment || 'Neutral',
-      response_urgency: parsed.response_urgency || 'Medium',
-      predicted_escalation_type: parsed.predicted_escalation_type || 'Standard Support',
-      recommended_preemptive_action: parsed.recommended_preemptive_action || 'Monitor engagement and follow standard procedures.',
-      agent_talking_points: parsed.agent_talking_points || [],
-      priority_level: parsed.priority_level || 'Medium',
+      frustration_score: parsed?.frustration_score || 30,
+      escalation_probability: parsed?.escalation_probability || 20,
+      frustration_indicators: parsed?.frustration_indicators || [],
+      recent_issues: parsed?.recent_issues || { issues: [] },
+      communication_sentiment: parsed?.communication_sentiment || 'Neutral',
+      response_urgency: parsed?.response_urgency || 'Medium',
+      predicted_escalation_type: parsed?.predicted_escalation_type || 'Standard Support',
+      recommended_preemptive_action: parsed?.recommended_preemptive_action || (escalFb ? 'AI temporarily unavailable. Manual review recommended.' : 'Monitor engagement and follow standard procedures.'),
+      agent_talking_points: parsed?.agent_talking_points || [],
+      priority_level: parsed?.priority_level || 'Medium',
+      ai_unavailable: escalFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3736,38 +3468,25 @@ Predict service metrics as JSON with:
 
 Enterprise/high-revenue customers should get faster service predictions.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are a customer service operations expert specializing in SLA prediction. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: slaFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are a customer service operations expert specializing in SLA prediction. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     res.json({
-      predicted_response_time: parsed.predicted_response_time || 30,
-      predicted_resolution_time: parsed.predicted_resolution_time || 4,
-      sla_compliance_probability: parsed.sla_compliance_probability || 85,
-      service_tier: parsed.service_tier || 'Standard',
-      priority_score: parsed.priority_score || 50,
-      queue_position: parsed.queue_position || 10,
-      expected_first_response: parsed.expected_first_response || 'within 30 minutes',
-      expected_resolution: parsed.expected_resolution || 'within 4 hours',
-      bottleneck_factors: parsed.bottleneck_factors || [],
-      optimization_suggestions: parsed.optimization_suggestions || [],
-      agent_workload_impact: parsed.agent_workload_impact || 'Medium',
-      customer_patience_index: parsed.customer_patience_index || 70,
+      predicted_response_time: parsed?.predicted_response_time || 30,
+      predicted_resolution_time: parsed?.predicted_resolution_time || 4,
+      sla_compliance_probability: parsed?.sla_compliance_probability || 85,
+      service_tier: parsed?.service_tier || 'Standard',
+      priority_score: parsed?.priority_score || 50,
+      queue_position: parsed?.queue_position || 10,
+      expected_first_response: parsed?.expected_first_response || 'within 30 minutes',
+      expected_resolution: parsed?.expected_resolution || 'within 4 hours',
+      bottleneck_factors: parsed?.bottleneck_factors || [],
+      optimization_suggestions: parsed?.optimization_suggestions || [],
+      agent_workload_impact: parsed?.agent_workload_impact || 'Medium',
+      customer_patience_index: parsed?.customer_patience_index || 70,
+      ai_unavailable: slaFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
@@ -3883,42 +3602,942 @@ Generate response as JSON with:
 
 Enterprise/VIP customers get more detailed responses.`;
 
-    const startTime = Date.now();
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'Churn Prediction System' },
-      body: JSON.stringify({ model: process.env.OPENROUTER_MODEL, messages: [{ role: 'system', content: 'You are an expert customer service representative. Respond only with valid JSON.' }, { role: 'user', content: prompt }] })
-    });
-    const elapsed = Date.now() - startTime;
-    const aiResult = await response.json();
-    if (aiResult.error) return res.status(500).json({ error: 'AI error', details: aiResult.error });
-
-    let parsed;
-    try {
-      let content = aiResult.choices?.[0]?.message?.content?.trim() || '';
-      if (content.startsWith('```json')) content = content.slice(7);
-      if (content.startsWith('```')) content = content.slice(3);
-      if (content.endsWith('```')) content = content.slice(0, -3);
-      parsed = JSON.parse(content.trim());
-    } catch (e) { return res.status(500).json({ error: 'Failed to parse AI response' }); }
+    const { data: parsed, elapsed, fallback: responseFb } = await callOpenRouterAI(
+      [{ role: 'system', content: 'You are an expert customer service representative. Respond only with valid JSON.' }, { role: 'user', content: prompt }],
+      {}
+    );
 
     res.json({
-      suggested_response: parsed.suggested_response || 'Thank you for reaching out. We will review your request shortly.',
-      response_tone: parsed.response_tone || 'Professional',
-      personalization_level: parsed.personalization_level || 50,
-      key_points: parsed.key_points || [],
-      empathy_phrases: parsed.empathy_phrases || [],
-      solution_steps: parsed.solution_steps || [],
-      follow_up_actions: parsed.follow_up_actions || { actions: [] },
-      estimated_satisfaction: parsed.estimated_satisfaction || 75,
-      alternative_responses: parsed.alternative_responses || [],
-      knowledge_base_links: parsed.knowledge_base_links || [],
+      suggested_response: parsed?.suggested_response || (responseFb ? 'AI temporarily unavailable. Please compose a response manually for this customer.' : 'Thank you for reaching out. We will review your request shortly.'),
+      response_tone: parsed?.response_tone || 'Professional',
+      personalization_level: parsed?.personalization_level || 50,
+      key_points: parsed?.key_points || [],
+      empathy_phrases: parsed?.empathy_phrases || [],
+      solution_steps: parsed?.solution_steps || [],
+      follow_up_actions: parsed?.follow_up_actions || { actions: [] },
+      estimated_satisfaction: parsed?.estimated_satisfaction || 75,
+      alternative_responses: parsed?.alternative_responses || [],
+      knowledge_base_links: parsed?.knowledge_base_links || [],
+      ai_unavailable: responseFb || !parsed,
       customer_name: customer.name,
       model_used: process.env.OPENROUTER_MODEL,
       response_time_ms: elapsed
     });
   } catch (error) {
     console.error('AI response suggestion error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============ TRANSACTIONAL COMPOSITE ENDPOINTS ============
+
+/**
+ * POST /api/customers/:id/flag-at-risk
+ * Atomically:
+ *   1. Updates the customer status to 'at-risk'
+ *   2. Creates an alert for the customer
+ *   3. Creates a pending intervention for the customer
+ * All three writes succeed or none do (ROLLBACK on any failure).
+ */
+app.post('/api/customers/:id/flag-at-risk', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { reason, intervention_type, alert_message } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Update customer status to at-risk
+    const customerUpdate = await client.query(
+      `UPDATE customers SET status = 'at-risk', updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND status != 'churned'
+       RETURNING id, name, company, status`,
+      [id]
+    );
+
+    if (customerUpdate.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer not found or already churned' });
+    }
+
+    const customer = customerUpdate.rows[0];
+
+    // 2. Create an alert for the at-risk flag
+    const alertResult = await client.query(
+      `INSERT INTO alerts (customer_id, alert_type, severity, message)
+       VALUES ($1, 'Churn Risk', 'high', $2)
+       RETURNING id`,
+      [id, alert_message || `Customer ${customer.name} flagged as at-risk. Reason: ${reason || 'Manual review'}`]
+    );
+
+    // 3. Create a pending intervention
+    const interventionResult = await client.query(
+      `INSERT INTO interventions (customer_id, type, description, priority, status, suggested_by)
+       VALUES ($1, $2, $3, 'High', 'pending', 'System')
+       RETURNING id`,
+      [id, intervention_type || 'Outreach Call', reason || 'Customer flagged as at-risk — immediate follow-up required']
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      message: 'Customer flagged as at-risk with alert and intervention created',
+      customer: customer,
+      alert_id: alertResult.rows[0].id,
+      intervention_id: interventionResult.rows[0].id
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Flag at-risk transaction error:', err.message);
+    res.status(500).json({ error: 'Transaction failed — no changes were saved', details: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /api/predictions/with-risk-score
+ * Atomically:
+ *   1. Creates a churn prediction record
+ *   2. Creates a corresponding risk score record
+ *   3. Updates the customer status if prediction score is high (>70)
+ * All three writes succeed or none do (ROLLBACK on any failure).
+ */
+app.post('/api/predictions/with-risk-score', authenticateToken, async (req, res) => {
+  const {
+    customer_id, prediction_score, confidence_level, factors, status, ai_analysis,
+    risk_level, risk_category, contributing_factors, recommended_actions
+  } = req.body;
+
+  if (!customer_id || prediction_score === undefined) {
+    return res.status(400).json({ error: 'customer_id and prediction_score are required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Verify customer exists
+    const customerCheck = await client.query('SELECT id, name, status FROM customers WHERE id = $1', [customer_id]);
+    if (customerCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    // 2. Insert churn prediction
+    const predictionResult = await client.query(
+      `INSERT INTO churn_predictions
+         (customer_id, prediction_score, prediction_date, confidence_level, factors, status, ai_analysis)
+       VALUES ($1, $2, CURRENT_DATE, $3, $4, $5, $6)
+       RETURNING *`,
+      [customer_id, prediction_score, confidence_level || null, factors || null, status || 'active', ai_analysis || null]
+    );
+
+    // 3. Insert corresponding risk score
+    const derivedRiskLevel = risk_level || (prediction_score >= 75 ? 'High' : prediction_score >= 50 ? 'Medium' : 'Low');
+    const riskScoreResult = await client.query(
+      `INSERT INTO risk_scores
+         (customer_id, risk_level, score, category, contributing_factors, recommended_actions)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [
+        customer_id,
+        derivedRiskLevel,
+        prediction_score,
+        risk_category || 'Churn Risk',
+        contributing_factors || factors || null,
+        recommended_actions || null
+      ]
+    );
+
+    // 4. Auto-update customer status to 'at-risk' if prediction score > 70
+    let customerStatusUpdated = false;
+    if (parseFloat(prediction_score) > 70 && customerCheck.rows[0].status === 'active') {
+      await client.query(
+        `UPDATE customers SET status = 'at-risk', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [customer_id]
+      );
+      customerStatusUpdated = true;
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      prediction: predictionResult.rows[0],
+      risk_score_id: riskScoreResult.rows[0].id,
+      customer_status_updated_to_at_risk: customerStatusUpdated,
+      message: 'Prediction and risk score created atomically'
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Prediction+risk score transaction error:', err.message);
+    res.status(500).json({ error: 'Transaction failed — no changes were saved', details: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ============ COHORT SURVIVAL ANALYSIS ============
+
+/**
+ * GET /api/analytics/cohort-survival
+ * Groups customers by signup_month cohort and calculates what percentage
+ * of each cohort is still active at 1, 3, 6, and 12 months.
+ * Returns a cohort matrix ready for frontend charting.
+ *
+ * No AI call — pure SQL analytics.
+ */
+app.get('/api/analytics/cohort-survival', authenticateToken, async (req, res) => {
+  try {
+    // Build cohort data: for each signup month, count total customers
+    // and count those still active at 1/3/6/12 months post-signup.
+    // We infer "still active at N months" as: status != 'churned' OR
+    // last_activity >= (signup_date + N months interval).
+    const cohortQuery = `
+      WITH cohorts AS (
+        SELECT
+          TO_CHAR(DATE_TRUNC('month', signup_date), 'YYYY-MM') AS cohort_month,
+          id AS customer_id,
+          signup_date,
+          status,
+          last_activity
+        FROM customers
+        WHERE signup_date IS NOT NULL
+      ),
+      cohort_stats AS (
+        SELECT
+          cohort_month,
+          COUNT(*)                                                                              AS total_customers,
+          COUNT(*) FILTER (WHERE status != 'churned'
+            OR last_activity >= (signup_date + INTERVAL '1 month'))                            AS active_at_1mo,
+          COUNT(*) FILTER (WHERE status != 'churned'
+            OR last_activity >= (signup_date + INTERVAL '3 months'))                           AS active_at_3mo,
+          COUNT(*) FILTER (WHERE status != 'churned'
+            OR last_activity >= (signup_date + INTERVAL '6 months'))                           AS active_at_6mo,
+          COUNT(*) FILTER (WHERE status != 'churned'
+            OR last_activity >= (signup_date + INTERVAL '12 months'))                          AS active_at_12mo
+        FROM cohorts
+        GROUP BY cohort_month
+      )
+      SELECT
+        cohort_month,
+        total_customers,
+        active_at_1mo,
+        active_at_3mo,
+        active_at_6mo,
+        active_at_12mo,
+        ROUND(100.0 * active_at_1mo  / NULLIF(total_customers, 0), 1) AS survival_pct_1mo,
+        ROUND(100.0 * active_at_3mo  / NULLIF(total_customers, 0), 1) AS survival_pct_3mo,
+        ROUND(100.0 * active_at_6mo  / NULLIF(total_customers, 0), 1) AS survival_pct_6mo,
+        ROUND(100.0 * active_at_12mo / NULLIF(total_customers, 0), 1) AS survival_pct_12mo
+      FROM cohort_stats
+      ORDER BY cohort_month ASC
+    `;
+
+    const result = await pool.query(cohortQuery);
+
+    // Build summary statistics across all cohorts
+    const rows = result.rows;
+    const totalCustomers = rows.reduce((sum, r) => sum + parseInt(r.total_customers), 0);
+    const avgSurvival1mo  = rows.length ? (rows.reduce((sum, r) => sum + parseFloat(r.survival_pct_1mo  || 0), 0) / rows.length).toFixed(1) : null;
+    const avgSurvival3mo  = rows.length ? (rows.reduce((sum, r) => sum + parseFloat(r.survival_pct_3mo  || 0), 0) / rows.length).toFixed(1) : null;
+    const avgSurvival6mo  = rows.length ? (rows.reduce((sum, r) => sum + parseFloat(r.survival_pct_6mo  || 0), 0) / rows.length).toFixed(1) : null;
+    const avgSurvival12mo = rows.length ? (rows.reduce((sum, r) => sum + parseFloat(r.survival_pct_12mo || 0), 0) / rows.length).toFixed(1) : null;
+
+    res.json({
+      cohorts: rows,
+      summary: {
+        total_cohorts: rows.length,
+        total_customers: totalCustomers,
+        avg_survival_pct_1mo: parseFloat(avgSurvival1mo),
+        avg_survival_pct_3mo: parseFloat(avgSurvival3mo),
+        avg_survival_pct_6mo: parseFloat(avgSurvival6mo),
+        avg_survival_pct_12mo: parseFloat(avgSurvival12mo)
+      },
+      generated_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Cohort survival analysis error:', error);
+    res.status(500).json({ error: 'Cohort survival analysis failed', details: error.message });
+  }
+});
+
+// ============ NEW AI ENDPOINTS ============
+
+/**
+ * POST /api/ai/cohort-analysis
+ * Groups customers by signup month, calculates churn rate per cohort,
+ * and uses AI to identify high-risk cohorts and provide strategic insights.
+ */
+app.post('/api/ai/cohort-analysis', authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    // Build cohort data from DB
+    const cohortResult = await pool.query(`
+      WITH cohorts AS (
+        SELECT
+          TO_CHAR(DATE_TRUNC('month', signup_date), 'YYYY-MM') AS cohort_month,
+          COUNT(*) AS total_customers,
+          COUNT(*) FILTER (WHERE status = 'churned') AS churned_customers,
+          COUNT(*) FILTER (WHERE status = 'active') AS active_customers,
+          COUNT(*) FILTER (WHERE status = 'at-risk') AS at_risk_customers,
+          ROUND(AVG(monthly_revenue)::numeric, 2) AS avg_revenue
+        FROM customers
+        WHERE signup_date IS NOT NULL
+        GROUP BY DATE_TRUNC('month', signup_date)
+      )
+      SELECT
+        cohort_month,
+        total_customers,
+        churned_customers,
+        active_customers,
+        at_risk_customers,
+        avg_revenue,
+        ROUND(100.0 * churned_customers / NULLIF(total_customers, 0), 1) AS churn_rate_pct
+      FROM cohorts
+      ORDER BY cohort_month ASC
+    `);
+
+    const cohorts = cohortResult.rows;
+
+    if (cohorts.length === 0) {
+      return res.status(404).json({ error: 'No cohort data available' });
+    }
+
+    const systemPrompt = 'You are an expert customer success AI specializing in SaaS churn prediction and retention strategy. Provide data-driven, actionable insights.';
+    const prompt = `Analyze the following customer cohort data and identify high-risk cohorts with strategic recommendations.
+
+Cohort Data (by signup month):
+${JSON.stringify(cohorts, null, 2)}
+
+Respond with a JSON object containing:
+- high_risk_cohorts: array of cohort months with churn_rate > 20% or significant at-risk customers, each with "cohort_month", "risk_level" ("Low"/"Medium"/"High"/"Critical"), and "risk_reason"
+- overall_health_assessment: summary of cohort health across all months
+- churn_patterns: identified patterns in when/why customers churn (e.g., early churn, seasonal patterns)
+- retention_recommendations: array of 3-5 targeted recommendations for specific cohorts or across all cohorts (each with "target_cohort", "strategy", and "expected_impact")
+- cohort_insights: array of 3 key observations about cohort performance
+- best_performing_cohort: the cohort with lowest churn rate and why it might be succeeding`;
+
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      {
+        high_risk_cohorts: cohorts.filter(c => parseFloat(c.churn_rate_pct) > 20).map(c => ({ cohort_month: c.cohort_month, risk_level: 'High', risk_reason: 'AI temporarily unavailable' })),
+        overall_health_assessment: 'AI temporarily unavailable — manual review required',
+        churn_patterns: [],
+        retention_recommendations: [{ target_cohort: 'All', strategy: 'Manual review required', expected_impact: 'Unknown' }],
+        cohort_insights: [],
+        best_performing_cohort: null
+      }
+    );
+
+    res.json({
+      cohorts,
+      analysis: parsed || {},
+      ai_unavailable: fallback || !parsed,
+      response_time_ms: elapsed,
+      generated_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('AI cohort analysis error:', error);
+    res.status(500).json({ error: 'Cohort analysis failed', details: error.message });
+  }
+});
+
+/**
+ * POST /api/ai/revenue-impact
+ * Body: { churn_predictions }
+ * Calculates MRR at risk, revenue impact by segment, expansion vs contraction revenue.
+ */
+app.post('/api/ai/revenue-impact', authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    const { churn_predictions } = req.body;
+
+    // If churn_predictions provided use them; otherwise query the DB
+    let predictions;
+    if (Array.isArray(churn_predictions) && churn_predictions.length > 0) {
+      predictions = churn_predictions;
+    } else {
+      const result = await pool.query(`
+        SELECT cp.customer_id, cp.prediction_score, cp.confidence_level, cp.factors,
+               c.name, c.company, c.plan, c.monthly_revenue, c.status
+        FROM churn_predictions cp
+        JOIN customers c ON cp.customer_id = c.id
+        ORDER BY cp.prediction_score DESC
+      `);
+      predictions = result.rows;
+    }
+
+    // Calculate revenue at risk tiers
+    const highRisk = predictions.filter(p => parseFloat(p.prediction_score) >= 70);
+    const mediumRisk = predictions.filter(p => parseFloat(p.prediction_score) >= 40 && parseFloat(p.prediction_score) < 70);
+    const lowRisk = predictions.filter(p => parseFloat(p.prediction_score) < 40);
+
+    const mrrHighRisk = highRisk.reduce((sum, p) => sum + parseFloat(p.monthly_revenue || 0), 0);
+    const mrrMediumRisk = mediumRisk.reduce((sum, p) => sum + parseFloat(p.monthly_revenue || 0), 0);
+    const mrrLowRisk = lowRisk.reduce((sum, p) => sum + parseFloat(p.monthly_revenue || 0), 0);
+    const totalMrr = mrrHighRisk + mrrMediumRisk + mrrLowRisk;
+
+    // Plan-level breakdown
+    const planBreakdown = predictions.reduce((acc, p) => {
+      const plan = p.plan || 'Unknown';
+      if (!acc[plan]) acc[plan] = { count: 0, mrr: 0, avg_risk: 0 };
+      acc[plan].count++;
+      acc[plan].mrr += parseFloat(p.monthly_revenue || 0);
+      acc[plan].avg_risk += parseFloat(p.prediction_score || 0);
+      return acc;
+    }, {});
+    Object.keys(planBreakdown).forEach(plan => {
+      planBreakdown[plan].avg_risk = Math.round(planBreakdown[plan].avg_risk / planBreakdown[plan].count);
+    });
+
+    const systemPrompt = 'You are an expert customer success AI specializing in SaaS churn prediction and retention strategy. Provide data-driven, actionable insights.';
+    const prompt = `Analyze the revenue impact of predicted churn and provide strategic financial insights.
+
+Revenue at Risk Summary:
+- Total MRR Analyzed: $${totalMrr.toFixed(2)}
+- High Risk (score >= 70): ${highRisk.length} customers, $${mrrHighRisk.toFixed(2)} MRR at risk
+- Medium Risk (score 40-69): ${mediumRisk.length} customers, $${mrrMediumRisk.toFixed(2)} MRR at risk
+- Low Risk (score < 40): ${lowRisk.length} customers, $${mrrLowRisk.toFixed(2)} MRR at risk
+
+Plan-Level Breakdown:
+${JSON.stringify(planBreakdown, null, 2)}
+
+Top 5 Highest-Risk by Revenue:
+${JSON.stringify(highRisk.sort((a, b) => parseFloat(b.monthly_revenue || 0) - parseFloat(a.monthly_revenue || 0)).slice(0, 5).map(p => ({ name: p.name, plan: p.plan, mrr: p.monthly_revenue, risk_score: p.prediction_score })), null, 2)}
+
+Respond with a JSON object containing:
+- mrr_at_risk_summary: object with "high_risk_mrr", "medium_risk_mrr", "low_risk_mrr", "total_mrr_analyzed", "percentage_at_high_risk"
+- revenue_impact_by_segment: analysis by plan tier with "segment", "mrr_at_risk", "recommended_action"
+- expansion_vs_contraction: assessment of net revenue impact ("expansion_opportunities", "contraction_risk", "net_impact_assessment")
+- priority_accounts: top 5 accounts to focus on immediately with "account", "reason", "recommended_action"
+- financial_projections: projected revenue loss at 30, 60, 90 days if no intervention
+- intervention_roi: estimated ROI of intervention programs to retain at-risk revenue`;
+
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      {
+        mrr_at_risk_summary: { high_risk_mrr: mrrHighRisk, medium_risk_mrr: mrrMediumRisk, low_risk_mrr: mrrLowRisk, total_mrr_analyzed: totalMrr, percentage_at_high_risk: totalMrr > 0 ? ((mrrHighRisk / totalMrr) * 100).toFixed(1) : 0 },
+        revenue_impact_by_segment: [],
+        expansion_vs_contraction: { expansion_opportunities: 'AI unavailable', contraction_risk: 'AI unavailable', net_impact_assessment: 'Manual review required' },
+        priority_accounts: [],
+        financial_projections: { day_30: mrrHighRisk * 0.3, day_60: mrrHighRisk * 0.5, day_90: mrrHighRisk * 0.7 },
+        intervention_roi: 'AI unavailable'
+      }
+    );
+
+    res.json({
+      input_predictions_count: predictions.length,
+      raw_metrics: {
+        total_mrr: totalMrr,
+        mrr_high_risk: mrrHighRisk,
+        mrr_medium_risk: mrrMediumRisk,
+        mrr_low_risk: mrrLowRisk,
+        plan_breakdown: planBreakdown
+      },
+      analysis: parsed || {},
+      ai_unavailable: fallback || !parsed,
+      response_time_ms: elapsed,
+      generated_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('AI revenue impact error:', error);
+    res.status(500).json({ error: 'Revenue impact analysis failed', details: error.message });
+  }
+});
+
+/**
+ * POST /api/ai/winback-campaign
+ * Body: { churned_customers[], time_since_churn }
+ * Returns personalized win-back message templates, optimal contact timing, incentive recommendations.
+ */
+app.post('/api/ai/winback-campaign', authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    const { churned_customers, time_since_churn } = req.body;
+
+    let customers;
+    if (Array.isArray(churned_customers) && churned_customers.length > 0) {
+      customers = churned_customers;
+    } else {
+      const result = await pool.query(`
+        SELECT c.*, cp.prediction_score, cp.factors as churn_factors
+        FROM customers c
+        LEFT JOIN churn_predictions cp ON c.id = cp.customer_id
+        WHERE c.status = 'churned'
+        ORDER BY c.updated_at DESC
+        LIMIT 50
+      `);
+      customers = result.rows;
+    }
+
+    if (customers.length === 0) {
+      return res.status(404).json({ error: 'No churned customers found' });
+    }
+
+    const timeSinceChurn = time_since_churn || 'various';
+
+    // Group by plan for segment-level templates
+    const byPlan = customers.reduce((acc, c) => {
+      const plan = c.plan || 'Unknown';
+      if (!acc[plan]) acc[plan] = [];
+      acc[plan].push(c);
+      return acc;
+    }, {});
+
+    const systemPrompt = 'You are an expert customer success AI specializing in SaaS churn prediction and retention strategy. Provide data-driven, actionable insights.';
+    const prompt = `Create personalized win-back campaign materials for churned SaaS customers.
+
+Time Since Churn: ${timeSinceChurn}
+Total Churned Customers: ${customers.length}
+Plan Distribution: ${JSON.stringify(Object.entries(byPlan).map(([plan, custs]) => ({ plan, count: custs.length, avg_mrr: (custs.reduce((s, c) => s + parseFloat(c.monthly_revenue || 0), 0) / custs.length).toFixed(2) })), null, 2)}
+
+Sample Churned Customer Profiles (first 10):
+${JSON.stringify(customers.slice(0, 10).map(c => ({ name: c.name, company: c.company, plan: c.plan, mrr: c.monthly_revenue, churn_factors: c.churn_factors })), null, 2)}
+
+Respond with a JSON object containing:
+- message_templates: array of 3-4 win-back email templates, each with "name" (e.g., "30-Day Winback"), "subject_line", "email_body" (2-3 paragraphs), "tone", and "best_for" (which customer type)
+- optimal_contact_timing: object with "day_ranges" (recommended days since churn to reach out), "best_time_of_day", "frequency" (how often to follow up), and "channel_priority" (email, phone, etc.)
+- incentive_recommendations: array of 4-5 incentive ideas (each with "incentive_type", "description", "discount_percentage" if applicable, "target_segment", and "expected_success_rate")
+- segmentation_strategy: how to group churned customers for different win-back approaches
+- success_metrics: KPIs to track win-back campaign effectiveness`;
+
+    const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+      [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      {
+        message_templates: [{ name: 'Generic Winback', subject_line: "We'd love to have you back", email_body: 'AI temporarily unavailable — please create template manually.', tone: 'Friendly', best_for: 'All churned customers' }],
+        optimal_contact_timing: { day_ranges: '7-30 days', best_time_of_day: 'Tuesday-Thursday, 10am-2pm', frequency: 'Weekly for 4 weeks', channel_priority: ['Email', 'Phone'] },
+        incentive_recommendations: [{ incentive_type: 'Discount', description: 'AI unavailable — manual review required', discount_percentage: 20, target_segment: 'All', expected_success_rate: 'Unknown' }],
+        segmentation_strategy: 'AI unavailable',
+        success_metrics: ['Reactivation rate', 'Time to reactivation', 'MRR recovered']
+      }
+    );
+
+    res.json({
+      churned_customers_analyzed: customers.length,
+      time_since_churn: timeSinceChurn,
+      plan_distribution: byPlan,
+      campaign: parsed || {},
+      ai_unavailable: fallback || !parsed,
+      response_time_ms: elapsed,
+      generated_at: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('AI winback campaign error:', error);
+    res.status(500).json({ error: 'Win-back campaign generation failed', details: error.message });
+  }
+});
+
+// ============ HEALTH SCORE TREND TRACKING ============
+
+/**
+ * POST /api/health-scores/snapshot
+ * Saves current health scores for all customers to a snapshots table for trend tracking.
+ * Creates the table if it doesn't exist.
+ */
+app.post('/api/health-scores/snapshot', authenticateToken, async (req, res) => {
+  try {
+    // Ensure snapshots table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS health_score_snapshots (
+        id SERIAL PRIMARY KEY,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        overall_health NUMERIC(5,2),
+        product_usage NUMERIC(5,2),
+        customer_satisfaction NUMERIC(5,2),
+        growth_potential NUMERIC(5,2),
+        support_health NUMERIC(5,2),
+        financial_health NUMERIC(5,2),
+        trend VARCHAR(20),
+        snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_hss_customer_date
+        ON health_score_snapshots (customer_id, snapshot_date DESC)
+    `);
+
+    // Copy current health_scores into the snapshot table
+    const result = await pool.query(`
+      INSERT INTO health_score_snapshots
+        (customer_id, overall_health, product_usage, customer_satisfaction,
+         growth_potential, support_health, financial_health, trend, snapshot_date)
+      SELECT
+        customer_id, overall_health, product_usage, customer_satisfaction,
+        growth_potential, support_health, financial_health, trend, CURRENT_DATE
+      FROM health_scores
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    `);
+
+    res.json({
+      message: 'Health score snapshot created successfully',
+      snapshot_date: new Date().toISOString().split('T')[0],
+      customers_snapshotted: result.rowCount
+    });
+  } catch (error) {
+    console.error('Health score snapshot error:', error);
+    res.status(500).json({ error: 'Health score snapshot failed', details: error.message });
+  }
+});
+
+/**
+ * GET /api/health-scores/:customer_id/trend
+ * Returns last 90 days of health score history for a given customer.
+ */
+app.get('/api/health-scores/:customer_id/trend', authenticateToken, async (req, res) => {
+  try {
+    const { customer_id } = req.params;
+
+    // Ensure table exists before querying
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS health_score_snapshots (
+        id SERIAL PRIMARY KEY,
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        overall_health NUMERIC(5,2),
+        product_usage NUMERIC(5,2),
+        customer_satisfaction NUMERIC(5,2),
+        growth_potential NUMERIC(5,2),
+        support_health NUMERIC(5,2),
+        financial_health NUMERIC(5,2),
+        trend VARCHAR(20),
+        snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    const customerCheck = await pool.query('SELECT id, name, company FROM customers WHERE id = $1', [customer_id]);
+    if (customerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const result = await pool.query(`
+      SELECT
+        snapshot_date,
+        overall_health,
+        product_usage,
+        customer_satisfaction,
+        growth_potential,
+        support_health,
+        financial_health,
+        trend
+      FROM health_score_snapshots
+      WHERE customer_id = $1
+        AND snapshot_date >= CURRENT_DATE - INTERVAL '90 days'
+      ORDER BY snapshot_date ASC
+    `, [customer_id]);
+
+    const snapshots = result.rows;
+
+    // Compute simple trend direction from first to last
+    let trendDirection = 'stable';
+    if (snapshots.length >= 2) {
+      const first = parseFloat(snapshots[0].overall_health || 0);
+      const last = parseFloat(snapshots[snapshots.length - 1].overall_health || 0);
+      const diff = last - first;
+      if (diff > 5) trendDirection = 'improving';
+      else if (diff < -5) trendDirection = 'declining';
+    }
+
+    res.json({
+      customer_id: parseInt(customer_id),
+      customer_name: customerCheck.rows[0].name,
+      company: customerCheck.rows[0].company,
+      period: '90 days',
+      snapshots_count: snapshots.length,
+      trend_direction: trendDirection,
+      snapshots
+    });
+  } catch (error) {
+    console.error('Health score trend error:', error);
+    res.status(500).json({ error: 'Health score trend fetch failed', details: error.message });
+  }
+});
+
+// ============ BULK RISK SCORING ============
+
+// In-memory job store for async bulk risk scoring
+const bulkRiskJobs = new Map();
+
+/**
+ * POST /api/customers/bulk-risk-score
+ * Queues an async AI risk scoring job for all customers.
+ * Returns a job_id immediately; processing runs in background.
+ */
+app.post('/api/customers/bulk-risk-score', authenticateToken, async (req, res) => {
+  try {
+    const jobId = `bulk_risk_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    bulkRiskJobs.set(jobId, {
+      status: 'queued',
+      started_at: new Date().toISOString(),
+      completed_at: null,
+      total_customers: 0,
+      processed: 0,
+      errors: 0,
+      results: []
+    });
+
+    // Return job ID immediately before processing starts
+    res.json({
+      job_id: jobId,
+      status: 'queued',
+      message: 'Bulk risk scoring job queued. Use GET /api/customers/bulk-risk-score/:job_id to check status.',
+      poll_url: `/api/customers/bulk-risk-score/${jobId}`
+    });
+
+    // Process asynchronously without blocking the response
+    setImmediate(async () => {
+      const job = bulkRiskJobs.get(jobId);
+      job.status = 'processing';
+
+      try {
+        const customersResult = await pool.query(`
+          SELECT c.id, c.name, c.company, c.plan, c.monthly_revenue, c.status, c.last_activity,
+                 es.overall_score as engagement_score,
+                 hs.overall_health as health_score,
+                 COUNT(st.id) FILTER (WHERE st.status = 'open') as open_tickets
+          FROM customers c
+          LEFT JOIN engagement_scores es ON c.id = es.customer_id
+          LEFT JOIN health_scores hs ON c.id = hs.customer_id
+          LEFT JOIN support_tickets st ON c.id = st.customer_id
+          WHERE c.status != 'churned'
+          GROUP BY c.id, es.overall_score, hs.overall_health
+          ORDER BY c.id
+        `);
+
+        const customers = customersResult.rows;
+        job.total_customers = customers.length;
+
+        // Process in batches of 5 to avoid overwhelming the AI API
+        const batchSize = 5;
+        for (let i = 0; i < customers.length; i += batchSize) {
+          const batch = customers.slice(i, i + batchSize);
+
+          await Promise.allSettled(batch.map(async (customer) => {
+            try {
+              const prompt = `Quick risk assessment for SaaS customer:
+Customer: ${customer.name} (${customer.company})
+Plan: ${customer.plan}, MRR: $${customer.monthly_revenue}, Status: ${customer.status}
+Engagement Score: ${customer.engagement_score || 'N/A'}
+Health Score: ${customer.health_score || 'N/A'}
+Open Tickets: ${customer.open_tickets || 0}
+
+Respond only with JSON: { "risk_level": "Low|Medium|High|Critical", "score": 0-100, "category": "main risk category", "top_factors": ["factor1", "factor2"] }`;
+
+              const { data: parsed, elapsed, fallback } = await callOpenRouterAI(
+                [
+                  { role: 'system', content: 'You are a risk assessment expert. Respond only with valid JSON.' },
+                  { role: 'user', content: prompt }
+                ],
+                { risk_level: 'Unknown', score: 50, category: 'AI Unavailable', top_factors: ['Manual review required'] }
+              );
+
+              const riskData = parsed || { risk_level: 'Unknown', score: 50, category: 'AI Unavailable', top_factors: ['Manual review required'] };
+
+              // Store result in DB
+              await pool.query(`
+                INSERT INTO risk_scores (customer_id, risk_level, score, category, contributing_factors, recommended_actions)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT DO NOTHING
+              `, [
+                customer.id,
+                riskData.risk_level,
+                riskData.score,
+                riskData.category,
+                riskData.top_factors ? JSON.stringify(riskData.top_factors) : null,
+                null
+              ]);
+
+              job.results.push({
+                customer_id: customer.id,
+                customer_name: customer.name,
+                risk_level: riskData.risk_level,
+                score: riskData.score,
+                category: riskData.category,
+                ai_unavailable: fallback || !parsed,
+                response_time_ms: elapsed
+              });
+              job.processed++;
+            } catch (customerErr) {
+              console.error(`Bulk risk score error for customer ${customer.id}:`, customerErr.message);
+              job.errors++;
+              job.processed++;
+            }
+          }));
+        }
+
+        job.status = 'completed';
+        job.completed_at = new Date().toISOString();
+      } catch (jobErr) {
+        console.error('Bulk risk scoring job error:', jobErr.message);
+        job.status = 'failed';
+        job.error = jobErr.message;
+        job.completed_at = new Date().toISOString();
+      }
+    });
+  } catch (error) {
+    console.error('Bulk risk score error:', error);
+    res.status(500).json({ error: 'Failed to queue bulk risk scoring job', details: error.message });
+  }
+});
+
+/**
+ * GET /api/customers/bulk-risk-score/:job_id
+ * Check the status of a bulk risk scoring job.
+ */
+app.get('/api/customers/bulk-risk-score/:job_id', authenticateToken, async (req, res) => {
+  try {
+    const { job_id } = req.params;
+    const job = bulkRiskJobs.get(job_id);
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found or expired' });
+    }
+
+    res.json({
+      job_id,
+      status: job.status,
+      started_at: job.started_at,
+      completed_at: job.completed_at,
+      total_customers: job.total_customers,
+      processed: job.processed,
+      errors: job.errors,
+      progress_pct: job.total_customers > 0 ? Math.round((job.processed / job.total_customers) * 100) : 0,
+      results: job.status === 'completed' ? job.results : [],
+      error: job.error || undefined
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch job status' });
+  }
+});
+
+// ============ PAGINATION FOR REMAINING LIST ENDPOINTS ============
+// Add paginated variants for endpoints that only returned all records
+
+/**
+ * GET /api/predictions/paginated - Paginated churn predictions
+ */
+app.get('/api/predictions/paginated', authenticateToken, async (req, res) => {
+  try {
+    const { query: q, countQuery, params, countParams, pageNum, limitNum } = buildListQuery(
+      'churn_predictions',
+      'SELECT cp.*, c.name as customer_name, c.company, c.email as customer_email FROM churn_predictions cp JOIN customers c ON cp.customer_id = c.id',
+      req,
+      ['c.name', 'c.company', 'cp.status']
+    );
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(q, params),
+      pool.query(countQuery, countParams)
+    ]);
+    res.json({
+      data: dataResult.rows,
+      pagination: { page: pageNum, limit: limitNum, total: parseInt(countResult.rows[0].count), totalPages: Math.ceil(parseInt(countResult.rows[0].count) / limitNum) }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * GET /api/risk-scores/paginated - Paginated risk scores
+ */
+app.get('/api/risk-scores/paginated', authenticateToken, async (req, res) => {
+  try {
+    const { query: q, countQuery, params, countParams, pageNum, limitNum } = buildListQuery(
+      'risk_scores',
+      'SELECT rs.*, c.name as customer_name, c.company FROM risk_scores rs JOIN customers c ON rs.customer_id = c.id',
+      req,
+      ['c.name', 'c.company', 'rs.risk_level', 'rs.category']
+    );
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(q, params),
+      pool.query(countQuery, countParams)
+    ]);
+    res.json({
+      data: dataResult.rows,
+      pagination: { page: pageNum, limit: limitNum, total: parseInt(countResult.rows[0].count), totalPages: Math.ceil(parseInt(countResult.rows[0].count) / limitNum) }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * GET /api/interventions/paginated - Paginated interventions
+ */
+app.get('/api/interventions/paginated', authenticateToken, async (req, res) => {
+  try {
+    const { query: q, countQuery, params, countParams, pageNum, limitNum } = buildListQuery(
+      'interventions',
+      'SELECT i.*, c.name as customer_name, c.company FROM interventions i JOIN customers c ON i.customer_id = c.id',
+      req,
+      ['c.name', 'c.company', 'i.type', 'i.status', 'i.priority']
+    );
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(q, params),
+      pool.query(countQuery, countParams)
+    ]);
+    res.json({
+      data: dataResult.rows,
+      pagination: { page: pageNum, limit: limitNum, total: parseInt(countResult.rows[0].count), totalPages: Math.ceil(parseInt(countResult.rows[0].count) / limitNum) }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * GET /api/tickets/paginated - Paginated support tickets
+ */
+app.get('/api/tickets/paginated', authenticateToken, async (req, res) => {
+  try {
+    const { query: q, countQuery, params, countParams, pageNum, limitNum } = buildListQuery(
+      'support_tickets',
+      'SELECT st.*, c.name as customer_name, c.company FROM support_tickets st JOIN customers c ON st.customer_id = c.id',
+      req,
+      ['c.name', 'c.company', 'st.subject', 'st.status', 'st.priority', 'st.category']
+    );
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(q, params),
+      pool.query(countQuery, countParams)
+    ]);
+    res.json({
+      data: dataResult.rows,
+      pagination: { page: pageNum, limit: limitNum, total: parseInt(countResult.rows[0].count), totalPages: Math.ceil(parseInt(countResult.rows[0].count) / limitNum) }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/**
+ * GET /api/alerts/paginated - Paginated alerts
+ */
+app.get('/api/alerts/paginated', authenticateToken, async (req, res) => {
+  try {
+    const { query: q, countQuery, params, countParams, pageNum, limitNum } = buildListQuery(
+      'alerts',
+      'SELECT a.*, c.name as customer_name, c.company FROM alerts a JOIN customers c ON a.customer_id = c.id',
+      req,
+      ['c.name', 'c.company', 'a.alert_type', 'a.severity']
+    );
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(q, params),
+      pool.query(countQuery, countParams)
+    ]);
+    res.json({
+      data: dataResult.rows,
+      pagination: { page: pageNum, limit: limitNum, total: parseInt(countResult.rows[0].count), totalPages: Math.ceil(parseInt(countResult.rows[0].count) / limitNum) }
+    });
+  } catch (error) {
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -3944,3 +4563,15 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Security: Helmet enabled, Rate limiting active, Input sanitization on`);
 });
+
+
+// === Batch 01 Gaps & Frontend Mounts ===
+app.use('/api/gap-no-production-ml-model-wiring-predictions-stored-a', require('./routes/gap_no_production_ml_model_wiring_predictions_stored_a'));
+app.use('/api/gap-no-automated-clustering-segment-discovery', require('./routes/gap_no_automated_clustering_segment_discovery'));
+app.use('/api/gap-no-ai-win-back-message-variant-generator-linked-to', require('./routes/gap_no_ai_win_back_message_variant_generator_linked_to'));
+app.use('/api/gap-no-streaming-feature-usage-signal-analyzer', require('./routes/gap_no_streaming_feature_usage_signal_analyzer'));
+app.use('/api/gap-codebase-not-modularized-into-route-files-maintain', require('./routes/gap_codebase_not_modularized_into_route_files_maintain'));
+app.use('/api/gap-no-webhook-outbound-api', require('./routes/gap_no_webhook_outbound_api'));
+app.use('/api/gap-no-data-ingest-pipeline-from-crm-billing-systems', require('./routes/gap_no_data_ingest_pipeline_from_crm_billing_systems'));
+app.use('/api/gap-no-notification-delivery-channel-alerts-table-only', require('./routes/gap_no_notification_delivery_channel_alerts_table_only'));
+app.use('/api/gap-no-campaign-playbook-orchestration-ui', require('./routes/gap_no_campaign_playbook_orchestration_ui'));
