@@ -16,6 +16,7 @@ import FeatureCorrelation from './components/FeatureCorrelation';
 import CompetitorIntel from './components/CompetitorIntel';
 import ForecastConfidence from './components/ForecastConfidence';
 import BatchInterventions from './components/BatchInterventions';
+import CustomViewsPage from './components/CustomViewsPage';
 import api, { API_URL } from './api';
 
 // Auth Context
@@ -519,6 +520,7 @@ function Layout({ children }) {
     { path: '/competitor-intel', label: 'Competitor Intel', icon: '🕵️' },
     { path: '/forecast-confidence', label: 'Forecast Confidence', icon: '📈' },
     { path: '/batch-interventions', label: 'Batch Scheduling', icon: '📆' },
+    { path: '/custom-views', label: 'Retention Views', icon: '🧩' },
     { path: '/profile', label: 'User Profile', icon: '👤' },
   ];
 
@@ -2824,6 +2826,7 @@ function App() {
                       <Route path="/competitor-intel" element={<CompetitorIntel />} />
                       <Route path="/forecast-confidence" element={<ForecastConfidence />} />
                       <Route path="/batch-interventions" element={<BatchInterventions />} />
+                      <Route path="/custom-views" element={<CustomViewsPage />} />
                     </Routes>
                   </Layout>
                 ) : (

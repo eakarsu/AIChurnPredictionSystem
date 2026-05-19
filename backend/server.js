@@ -3,7 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { body, query, validationResult } = require('express-validator');
 const { v4: uuidv4 } = require('uuid');
 const PDFDocument = require('pdfkit');
@@ -82,7 +82,7 @@ const aiLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => ipKeyGenerator(req.ip),
   message: { error: 'AI rate limit exceeded. Maximum 10 AI requests per 15 minutes per IP.' }
 });
 
@@ -4541,6 +4541,9 @@ app.get('/api/alerts/paginated', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+
+// === Custom Views (4 new features) - mounted before 404 handler ===
+app.use('/api/custom-views', require('./routes/customViews'));
 
 // ============ GLOBAL ERROR HANDLER ============
 app.use((err, req, res, next) => {
