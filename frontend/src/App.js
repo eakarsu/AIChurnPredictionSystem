@@ -17,7 +17,11 @@ import CompetitorIntel from './components/CompetitorIntel';
 import ForecastConfidence from './components/ForecastConfidence';
 import BatchInterventions from './components/BatchInterventions';
 import CustomViewsPage from './components/CustomViewsPage';
+import RetentionSaveDesk from './components/RetentionSaveDesk';
 import api, { API_URL } from './api';
+
+import CodexCustomVizFeature from './pages/CodexCustomVizFeature';
+import CodexOperationsFeature from './pages/CodexOperationsFeature';
 
 // Auth Context
 const AuthContext = createContext(null);
@@ -520,6 +524,7 @@ function Layout({ children }) {
     { path: '/competitor-intel', label: 'Competitor Intel', icon: '🕵️' },
     { path: '/forecast-confidence', label: 'Forecast Confidence', icon: '📈' },
     { path: '/batch-interventions', label: 'Batch Scheduling', icon: '📆' },
+    { path: '/retention-save-desk', label: 'Retention Save Desk', icon: '🎯' },
     { path: '/custom-views', label: 'Retention Views', icon: '🧩' },
     { path: '/profile', label: 'User Profile', icon: '👤' },
   ];
@@ -2783,6 +2788,9 @@ function App() {
       <ToastProvider>
         <BrowserRouter>
           <Routes>
+        <Route path="/codex/custom-viz" element={<CodexCustomVizFeature />} />
+        <Route path="/codex/operations" element={<CodexOperationsFeature />} />
+
             <Route path="/login" element={user ? <Navigate to="/" /> : <Login />} />
             <Route path="/register" element={user ? <Navigate to="/" /> : <Register />} />
             <Route path="/forgot-password" element={user ? <Navigate to="/" /> : <ForgotPassword />} />
@@ -2826,6 +2834,7 @@ function App() {
                       <Route path="/competitor-intel" element={<CompetitorIntel />} />
                       <Route path="/forecast-confidence" element={<ForecastConfidence />} />
                       <Route path="/batch-interventions" element={<BatchInterventions />} />
+                      <Route path="/retention-save-desk" element={<RetentionSaveDesk />} />
                       <Route path="/custom-views" element={<CustomViewsPage />} />
                     </Routes>
                   </Layout>

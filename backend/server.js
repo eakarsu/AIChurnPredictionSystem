@@ -4545,6 +4545,36 @@ app.get('/api/alerts/paginated', authenticateToken, async (req, res) => {
 // === Custom Views (4 new features) - mounted before 404 handler ===
 app.use('/api/custom-views', require('./routes/customViews'));
 
+app.post('/api/retention-save-desk/plan', authenticateToken, aiLimiter, asyncHandler(async (req, res) => {
+  const {
+    customer = { name: 'Unknown account', arr: 0, renewalDays: 90, healthScore: 50 },
+    signals = [],
+    contract = {},
+  } = req.body || {};
+
+  const health = Math.max(0, Math.min(100, Number(customer.healthScore ?? 50)));
+  const renewalDays = Math.max(0, Number(customer.renewalDays ?? 90));
+  const arr = Math.max(0, Number(customer.arr ?? 0));
+  const signalPenalty = Array.isArray(signals) ? Math.min(30, signals.length * 6) : 0;
+  const urgency = renewalDays <= 45 ? 20 : renewalDays <= 90 ? 10 : 0;
+  const saveScore = Math.max(5, Math.min(95, Math.round(100 - health + signalPenalty + urgency)));
+  const motion = saveScore >= 75 ? 'executive save room' : saveScore >= 50 ? 'CSM recovery sprint' : 'standard renewal nurture';
+
+  res.json({
+    account: customer.name,
+    product: contract.product || 'Core platform',
+    saveScore,
+    motion,
+    arrAtRisk: Math.round(arr * (saveScore / 100)),
+    actions: [
+      { owner: 'CSM', task: 'Run adoption gap review and confirm business outcomes.', due: 'within 2 business days' },
+      { owner: 'Support', task: 'Clear blocker tickets and publish a resolution note.', due: renewalDays <= 45 ? 'today' : 'this week' },
+      { owner: 'Executive sponsor', task: 'Send renewal-risk check-in with mutual success plan.', due: saveScore >= 75 ? 'today' : 'within 5 days' },
+    ],
+    talkTrack: `Anchor on ${customer.name || 'the account'} outcomes, acknowledge ${Array.isArray(signals) && signals[0] ? signals[0] : 'recent risk signals'}, then trade a short recovery plan for renewal confidence.`,
+  });
+}));
+
 // ============ GLOBAL ERROR HANDLER ============
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
