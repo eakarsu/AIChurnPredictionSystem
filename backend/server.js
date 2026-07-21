@@ -9,27 +9,12 @@ const { v4: uuidv4 } = require('uuid');
 const PDFDocument = require('pdfkit');
 const pool = require('./db');
 require('dotenv').config({ path: '../.env' });
+require('./config/runtime').validateRuntime();
 
 const app = express();
 const PORT = process.env.BACKEND_PORT || 3001;
 
-// ============ DB-BACKED TOKEN BLACKLIST SETUP ============
-// Initializes the token_blacklist table if it doesn't exist.
-// Falls back to an in-memory Set if the DB is unavailable at startup.
-(async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS token_blacklist (
-        token TEXT PRIMARY KEY,
-        expires_at TIMESTAMPTZ NOT NULL
-      )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires ON token_blacklist (expires_at)`);
-    console.log('Token blacklist table ready');
-  } catch (err) {
-    console.error('Could not create token_blacklist table:', err.message);
-  }
-})();
+// Schema is managed explicitly by scripts/migrate.sh; startup never creates tables.
 
 // Periodically purge expired tokens from the DB blacklist (every 30 minutes)
 setInterval(async () => {
@@ -52,7 +37,8 @@ app.use(helmet({
 }));
 
 // CORS
-app.use(cors());
+const allowedOrigins=(process.env.CORS_ORIGINS||'http://localhost:3000').split(',').map(v=>v.trim()).filter(Boolean);
+app.use(cors({origin:(origin,cb)=>!origin||allowedOrigins.includes(origin)?cb(null,true):cb(new Error('origin not allowed')),credentials:true}));
 
 // Body parser
 app.use(express.json({ limit: '10mb' }));
@@ -4544,6 +4530,7 @@ app.get('/api/alerts/paginated', authenticateToken, async (req, res) => {
 
 // === Custom Views (4 new features) - mounted before 404 handler ===
 app.use('/api/custom-views', require('./routes/customViews'));
+app.use('/api/governed-retention', require('./routes/governedRetention'));
 
 app.post('/api/retention-save-desk/plan', authenticateToken, aiLimiter, asyncHandler(async (req, res) => {
   const {
@@ -4596,15 +4583,3 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Security: Helmet enabled, Rate limiting active, Input sanitization on`);
 });
-
-
-// === Batch 01 Gaps & Frontend Mounts ===
-app.use('/api/gap-no-production-ml-model-wiring-predictions-stored-a', require('./routes/gap_no_production_ml_model_wiring_predictions_stored_a'));
-app.use('/api/gap-no-automated-clustering-segment-discovery', require('./routes/gap_no_automated_clustering_segment_discovery'));
-app.use('/api/gap-no-ai-win-back-message-variant-generator-linked-to', require('./routes/gap_no_ai_win_back_message_variant_generator_linked_to'));
-app.use('/api/gap-no-streaming-feature-usage-signal-analyzer', require('./routes/gap_no_streaming_feature_usage_signal_analyzer'));
-app.use('/api/gap-codebase-not-modularized-into-route-files-maintain', require('./routes/gap_codebase_not_modularized_into_route_files_maintain'));
-app.use('/api/gap-no-webhook-outbound-api', require('./routes/gap_no_webhook_outbound_api'));
-app.use('/api/gap-no-data-ingest-pipeline-from-crm-billing-systems', require('./routes/gap_no_data_ingest_pipeline_from_crm_billing_systems'));
-app.use('/api/gap-no-notification-delivery-channel-alerts-table-only', require('./routes/gap_no_notification_delivery_channel_alerts_table_only'));
-app.use('/api/gap-no-campaign-playbook-orchestration-ui', require('./routes/gap_no_campaign_playbook_orchestration_ui'));

@@ -1,0 +1,6 @@
+'use strict';const test=require('node:test');const assert=require('node:assert/strict');const {validateCohort,transition,shouldSuppress}=require('../domain/retentionWorkflow');
+const valid=()=>({cohortName:'July renewals',sources:[{system:'billing',snapshotAt:'2026-07-01',contractVersion:'v1'}],featureSet:{version:'f3',asOf:'2026-07-01'},model:{version:'m7',calibrationVersion:'c2'},consentPolicyVersion:'privacy-v4',suppressionRules:[{field:'doNotContact',equals:true}],metrics:{calibrationError:.03,driftScore:.08},experiment:{holdoutPercent:10}});
+test('requires reproducible source contracts',()=>assert.throws(()=>validateCohort({...valid(),sources:[{system:'billing'}]}),/versioned/));
+test('requires calibration and drift before scoring',()=>assert.throws(()=>transition('featured','scored','data_scientist',{...validateCohort(valid()),metrics:{}},'ok'),/calibration/));
+test('authorization requires experiment and approval',()=>{const r=validateCohort(valid());assert.throws(()=>transition('reviewed','authorized','analyst',r,'reviewed evidence'),/approval/);assert.equal(transition('reviewed','authorized','retention_manager',r,'fairness and experiment reviewed'),'authorized');});
+test('applies deterministic suppression',()=>assert.equal(shouldSuppress({doNotContact:true},valid().suppressionRules),true));
