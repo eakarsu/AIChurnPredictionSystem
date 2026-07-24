@@ -1703,7 +1703,8 @@ app.get('/api/export/pdf/:entity', authenticateToken, async (req, res) => {
 const callOpenRouterAI = async (messages, fallbackData = {}) => {
   const startTime = Date.now();
   try {
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const openRouterBaseUrl = (process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+    const response = await fetch(`${openRouterBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -1737,20 +1738,36 @@ const callOpenRouterAI = async (messages, fallbackData = {}) => {
       return { data: null, elapsed, fallback: true, rawContent: null, fallbackData };
     }
 
-    // Strip markdown code fences if present
-    let cleaned = rawContent.trim();
-    if (cleaned.startsWith('```json')) cleaned = cleaned.slice(7);
-    else if (cleaned.startsWith('```')) cleaned = cleaned.slice(3);
-    if (cleaned.endsWith('```')) cleaned = cleaned.slice(0, -3);
-    cleaned = cleaned.trim();
+    const candidates = [rawContent.trim()];
+    const fenced = rawContent.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced?.[1]) candidates.push(fenced[1].trim());
 
-    try {
-      const parsed = JSON.parse(cleaned);
-      return { data: parsed, elapsed, fallback: false, rawContent };
-    } catch (parseErr) {
-      console.error('OpenRouter JSON parse error:', parseErr.message, '| raw:', rawContent.substring(0, 200));
-      return { data: null, elapsed, fallback: true, rawContent, fallbackData };
+    const start = rawContent.indexOf('{');
+    if (start >= 0) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let index = start; index < rawContent.length; index += 1) {
+        const character = rawContent[index];
+        if (escaped) { escaped = false; continue; }
+        if (character === '\\') { escaped = true; continue; }
+        if (character === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (character === '{') depth += 1;
+        if (character === '}') depth -= 1;
+        if (depth === 0) {
+          candidates.push(rawContent.slice(start, index + 1));
+          break;
+        }
+      }
     }
+
+    for (const candidate of candidates) {
+      try {
+        return { data: JSON.parse(candidate), elapsed, fallback: false, rawContent };
+      } catch (_) {}
+    }
+    return { data: { summary: rawContent.trim() }, elapsed, fallback: false, rawContent };
   } catch (networkErr) {
     const elapsed = Date.now() - startTime;
     console.error('OpenRouter network error:', networkErr.message);
@@ -1767,9 +1784,6 @@ app.post('/api/ai/analyze-churn', authenticateToken, async (req, res) => {
     const { customer_id } = req.body;
 
     console.log('AI Analysis requested for customer:', customer_id);
-    console.log('Using OpenRouter API Key:', process.env.OPENROUTER_API_KEY ? 'Key exists (length: ' + process.env.OPENROUTER_API_KEY.length + ')' : 'NO KEY FOUND');
-    console.log('Using Model:', process.env.OPENROUTER_MODEL);
-
     // Get customer data
     const customerResult = await pool.query('SELECT * FROM customers WHERE id = $1', [customer_id]);
     const customer = customerResult.rows[0];
