@@ -9,6 +9,12 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD || 'postgres',
 });
 
+function requireDemoPassword() {
+  const password = process.env.DEMO_PASSWORD || process.env.SEED_DEMO_PASSWORD || process.env.DEMO_SEED_PASSWORD || '';
+  if (password.length < 12 || password.length > 1024) throw new Error('DEMO_PASSWORD must contain 12-1024 characters');
+  return password;
+}
+
 async function seed() {
   const client = await pool.connect();
 
@@ -459,7 +465,7 @@ async function seed() {
 
     // Seed Users
     const bcrypt = require('bcryptjs');
-    const hashedPassword = await bcrypt.hash('password123', 10);
+    const hashedPassword = await bcrypt.hash(requireDemoPassword(), 10);
 
     await appClient.query(`
       INSERT INTO users (email, password, name, role, email_verified, phone, department) VALUES
@@ -1001,7 +1007,7 @@ async function seed() {
     console.log('Response suggestions seeded');
 
     console.log('\n✅ Database seeding completed successfully!');
-    console.log('Default login: demo@churnpredict.com / password123');
+    console.log('Demo login users provisioned from the local environment.');
     console.log('\n🆕 NEW FEATURES ADDED:');
     console.log('  - AI Service Level Predictor (Customer Service)');
     console.log('  - AI Response Suggester (Customer Service)');
