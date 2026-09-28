@@ -162,11 +162,11 @@ function Login() {
           </div>
 
           <button type="submit" className="btn btn-primary" style={{ width: '100%', marginBottom: '12px' }} disabled={loading}>
-            {loading ? 'Logging in...' : 'Login'}
+            {loading ? 'Signing in...' : 'Sign In'}
           </button>
 
           <button type="button" className="btn btn-secondary" style={{ width: '100%', marginBottom: '12px' }} onClick={fillDemo}>
-            Fill Demo Credentials
+            Auto Fill Demo Credentials
           </button>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '16px' }}>
