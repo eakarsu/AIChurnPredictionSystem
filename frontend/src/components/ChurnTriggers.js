@@ -1,3 +1,4 @@
+import FormattedAIReport from "./FormattedAIReport";
 import React, { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from './Toast';
@@ -160,10 +161,7 @@ function ChurnTriggers() {
       {aiResult && (
         <div className="card" style={{ padding: 24, marginTop: 24 }}>
           <h3 style={{ color: '#fff', marginTop: 0 }}>🤖 AI Churn Analysis Result</h3>
-          <pre style={{
-            background: '#1a1a2e', color: '#e0e0e0', padding: 16, borderRadius: 8,
-            overflowX: 'auto', fontSize: 12, maxHeight: 500
-          }}>{JSON.stringify(aiResult, null, 2)}</pre>
+          <FormattedAIReport response={aiResult} />
         </div>
       )}
     </div>

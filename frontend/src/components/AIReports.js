@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import FormattedAIReport from './FormattedAIReport';
 import { useToast } from './Toast';
 import api from '../api';
 
@@ -119,7 +120,9 @@ ${report.action_items?.map((a, i) => `${i + 1}. ${a}`).join('\n') || 'N/A'}`;
               <><span style={{ marginRight: 10 }}>🤖</span> Generate AI Report</>
             )}
           </button>
+          <div className="ai-preset-bar"><span>Report examples</span><div style={{ display: 'flex', gap: 8 }}><button type="button" className="btn btn-secondary" onClick={() => setReportType('churn analysis')}>Churn analysis</button><button type="button" className="btn btn-secondary" onClick={() => setReportType('intervention effectiveness')}>Intervention effectiveness</button></div></div>
 
+          <FormattedAIReport response={report} title="Customer report" />
           {report && (
             <div style={styles.reportResult}>
               <div style={styles.reportHeader}>
@@ -237,6 +240,7 @@ ${report.action_items?.map((a, i) => `${i + 1}. ${a}`).join('\n') || 'N/A'}`;
             )}
           </button>
 
+          <FormattedAIReport response={revenueAnalysis} title="Revenue impact" />
           {revenueAnalysis && (
             <div style={styles.reportResult}>
               <div style={styles.reportHeader}>

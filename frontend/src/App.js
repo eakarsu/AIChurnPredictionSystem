@@ -19,6 +19,8 @@ import BatchInterventions from './components/BatchInterventions';
 import CustomViewsPage from './components/CustomViewsPage';
 import RetentionSaveDesk from './components/RetentionSaveDesk';
 import api, { API_URL } from './api';
+import FormattedAIReport, { reportText } from './components/FormattedAIReport';
+import AIPresetButtons from './components/AIPresetButtons';
 
 import CodexCustomVizFeature from './pages/CodexCustomVizFeature';
 import CodexOperationsFeature from './pages/CodexOperationsFeature';
@@ -124,8 +126,15 @@ function Login() {
   };
 
   const fillDemo = () => {
-    setEmail(process.env.REACT_APP_DEMO_EMAIL || '');
-    setPassword(process.env.REACT_APP_DEMO_PASSWORD || '');
+    const demoEmail = process.env.REACT_APP_DEMO_EMAIL;
+    const demoPassword = process.env.REACT_APP_DEMO_PASSWORD;
+    if (!demoEmail || !demoPassword) {
+      setError('Demo credentials are not configured for this frontend.');
+      return;
+    }
+    setError('');
+    setEmail(demoEmail);
+    setPassword(demoPassword);
   };
 
   return (
@@ -166,7 +175,7 @@ function Login() {
           </button>
 
           <button type="button" className="btn btn-secondary" style={{ width: '100%', marginBottom: '12px' }} onClick={fillDemo}>
-            Auto Fill Demo Credentials
+            Fill demo credentials
           </button>
 
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '16px' }}>
@@ -578,6 +587,7 @@ function CustomerForm({ item, onSave, onCancel }) {
     status: item?.status || 'active',
   });
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiResult, setAiResult] = useState(null);
   const toast = useToast();
 
   const handleAIAnalysis = async () => {
@@ -585,7 +595,7 @@ function CustomerForm({ item, onSave, onCancel }) {
     setAiLoading(true);
     try {
       const res = await api.post('/ai/analyze-customer', { name: form.name, company: form.company, email: form.email });
-      console.log('AI Customer Response:', res.data);
+      setAiResult(res.data);
       setForm(prev => ({ ...prev, name: res.data.name || prev.name, email: res.data.email || prev.email, company: res.data.company || prev.company, plan: res.data.plan || prev.plan, monthly_revenue: res.data.monthly_revenue || prev.monthly_revenue, signup_date: res.data.signup_date || prev.signup_date, status: res.data.status || prev.status }));
       toast.success(`AI analysis complete in ${res.data.response_time_ms}ms`);
     } catch (err) { toast.error('AI analysis failed: ' + (err.response?.data?.error || err.message)); }
@@ -594,6 +604,8 @@ function CustomerForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="CustomerForm" />
+      <FormattedAIReport response={aiResult} title="Customer AI analysis" />
       <div className="form-row">
         <div className="form-group">
           <label>Name *</label>
@@ -692,6 +704,8 @@ function PredictionForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, factors: form.factors.split(',').map(f => f.trim()).filter(f => f) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="PredictionForm" />
+      <FormattedAIReport response={aiResult} title="Prediction AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => { setForm({ ...form, customer_id: e.target.value }); setAiResult(null); }} required>
@@ -865,6 +879,8 @@ function RiskScoreForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, contributing_factors: form.contributing_factors.split(',').map(f => f.trim()).filter(f => f), recommended_actions: form.recommended_actions.split(',').map(f => f.trim()).filter(f => f) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="RiskScoreForm" />
+      <FormattedAIReport response={form.ai_response} title="RiskScore AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required>
@@ -958,6 +974,8 @@ function SegmentForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={handleSubmit}>
+      <AIPresetButtons form={form} setForm={setForm} formName="SegmentForm" />
+      <FormattedAIReport response={form.ai_response} title="Segment AI analysis" />
       <div className="form-group">
         <label>Name *</label>
         <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required />
@@ -1076,6 +1094,8 @@ function InterventionForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="InterventionForm" />
+      <FormattedAIReport response={aiSuggestions} title="Intervention AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => { setForm({ ...form, customer_id: e.target.value, ai_suggestions: null, ai_response_time_ms: null }); setAiSuggestions(null); }} required>
@@ -1207,6 +1227,8 @@ function BehaviorForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="BehaviorForm" />
+      <FormattedAIReport response={form.ai_response} title="Behavior AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #f59e0b, #ef4444)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Suggest Behavior'}</button>
       <div className="form-group"><label>Event Type *</label><input value={form.event_type} onChange={(e) => setForm({ ...form, event_type: e.target.value })} required /></div>
@@ -1237,6 +1259,8 @@ function MetricForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="MetricForm" />
+      <FormattedAIReport response={form.ai_response} title="Metric AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #6366f1, #22d3ee)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Suggest Metric'}</button>
       <div className="form-row"><div className="form-group"><label>Metric Name *</label><input value={form.metric_name} onChange={(e) => setForm({ ...form, metric_name: e.target.value })} required /></div><div className="form-group"><label>Metric Value *</label><input type="number" value={form.metric_value} onChange={(e) => setForm({ ...form, metric_value: e.target.value })} required /></div></div>
@@ -1290,6 +1314,8 @@ function EngagementForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="EngagementForm" />
+      <FormattedAIReport response={form.ai_response} title="Engagement AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required>
@@ -1363,6 +1389,8 @@ function TicketForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="TicketForm" />
+      <FormattedAIReport response={form.ai_response} title="Ticket AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required>
@@ -1423,6 +1451,8 @@ function BillingForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="BillingForm" />
+      <FormattedAIReport response={form.ai_response} title="Billing AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #10b981, #6366f1)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Suggest Billing'}</button>
       <div className="form-row"><div className="form-group"><label>Invoice Number *</label><input value={form.invoice_number} onChange={(e) => setForm({ ...form, invoice_number: e.target.value })} required /></div><div className="form-group"><label>Amount *</label><input type="number" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} required /></div></div>
@@ -1454,6 +1484,8 @@ function FeatureForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="FeatureForm" />
+      <FormattedAIReport response={form.ai_response} title="Feature AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #8b5cf6, #6366f1)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Suggest Feature Usage'}</button>
       <div className="form-row"><div className="form-group"><label>Feature Name *</label><input value={form.feature_name} onChange={(e) => setForm({ ...form, feature_name: e.target.value })} required /></div><div className="form-group"><label>Usage Count</label><input type="number" value={form.usage_count} onChange={(e) => setForm({ ...form, usage_count: e.target.value })} /></div></div>
@@ -1484,6 +1516,8 @@ function SessionForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="SessionForm" />
+      <FormattedAIReport response={form.ai_response} title="Session AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #22d3ee, #6366f1)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Suggest Session Data'}</button>
       <div className="form-row"><div className="form-group"><label>Session Start</label><div className="date-input-wrapper"><input type="datetime-local" value={form.session_start} onChange={(e) => setForm({ ...form, session_start: e.target.value })} /></div></div><div className="form-group"><label>Session End</label><div className="date-input-wrapper"><input type="datetime-local" value={form.session_end} onChange={(e) => setForm({ ...form, session_end: e.target.value })} /></div></div></div>
@@ -1515,6 +1549,8 @@ function NPSForm({ item, onSave, onCancel }) {
   };
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="NPSForm" />
+      <FormattedAIReport response={form.ai_response} title="NPS AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <div className="form-group"><label>Feedback</label><textarea value={form.feedback} onChange={(e) => setForm({ ...form, feedback: e.target.value })} rows={3} placeholder="Enter feedback to analyze..." /></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #f59e0b, #10b981)' }}>{aiLoading ? 'Analyzing...' : '🤖 AI Analyze Feedback'}</button>
@@ -1572,6 +1608,8 @@ function HealthForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="HealthForm" />
+      <FormattedAIReport response={form.ai_response} title="Health AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required>
@@ -1649,6 +1687,8 @@ function AlertForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="AlertForm" />
+      <FormattedAIReport response={form.ai_response} title="Alert AI analysis" />
       <div className="form-group">
         <label>Customer *</label>
         <select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required>
@@ -1726,6 +1766,8 @@ function SentimentForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, key_phrases: form.key_phrases.split(',').map(p => p.trim()).filter(p => p) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="SentimentForm" />
+      <FormattedAIReport response={form.ai_response} title="Sentiment AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <div className="form-row">
         <div className="form-group"><label>Feedback Source</label><select value={form.feedback_source} onChange={(e) => setForm({ ...form, feedback_source: e.target.value })}><option value="Survey">Survey</option><option value="Support Ticket">Support Ticket</option><option value="Email">Email</option><option value="Chat">Chat</option><option value="NPS">NPS</option><option value="Social Media">Social Media</option></select></div>
@@ -1801,6 +1843,8 @@ function JourneyForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="JourneyForm" />
+      <FormattedAIReport response={form.ai_response} title="Journey AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #06b6d4, #8b5cf6)' }}>{aiLoading ? <><span className="spinner" style={{ width: 16, height: 16, marginRight: 8 }}></span> Mapping Journey...</> : '🗺️ AI Map Journey'}</button>
       {aiResult && (
@@ -1872,6 +1916,8 @@ function WinbackForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave(form); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="WinbackForm" />
+      <FormattedAIReport response={form.ai_response} title="Winback AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #f59e0b, #ef4444)' }}>{aiLoading ? <><span className="spinner" style={{ width: 16, height: 16, marginRight: 8 }}></span> Generating Campaign...</> : '🎁 AI Generate Win-Back'}</button>
       {aiResult && (
@@ -1956,6 +2002,8 @@ function HealthDashboardForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, recommended_actions: form.recommended_actions.split('\n').filter(a => a.trim()) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="HealthDashboardForm" />
+      <FormattedAIReport response={form.ai_response} title="HealthDashboard AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #10b981, #22d3ee)' }}>{aiLoading ? <><span className="spinner" style={{ width: 16, height: 16, marginRight: 8 }}></span> Calculating Health...</> : '💚 AI Health Analysis'}</button>
       {aiResult && (
@@ -1977,8 +2025,8 @@ function HealthDashboardForm({ item, onSave, onCancel }) {
           </div>
           {(aiResult.risk_indicators?.items?.length > 0 || aiResult.positive_signals?.items?.length > 0) && (
             <div style={{ display: 'flex', gap: '12px', marginBottom: '12px' }}>
-              {aiResult.risk_indicators?.items?.length > 0 && (<div style={{ flex: 1 }}><p style={{ fontSize: '10px', color: '#ef4444', marginBottom: '4px' }}>Risk Indicators:</p>{aiResult.risk_indicators.items.map((r, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#fca5a5' }}>• {typeof r === 'string' ? r : (r.risk_factor || r.description || JSON.stringify(r))}</span>)}</div>)}
-              {aiResult.positive_signals?.items?.length > 0 && (<div style={{ flex: 1 }}><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Positive Signals:</p>{aiResult.positive_signals.items.map((p, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#6ee7b7' }}>• {typeof p === 'string' ? p : (p.positive_factor || p.description || JSON.stringify(p))}</span>)}</div>)}
+              {aiResult.risk_indicators?.items?.length > 0 && (<div style={{ flex: 1 }}><p style={{ fontSize: '10px', color: '#ef4444', marginBottom: '4px' }}>Risk Indicators:</p>{aiResult.risk_indicators.items.map((r, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#fca5a5' }}>• {typeof r === 'string' ? r : (r.risk_factor || r.description || reportText(r))}</span>)}</div>)}
+              {aiResult.positive_signals?.items?.length > 0 && (<div style={{ flex: 1 }}><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Positive Signals:</p>{aiResult.positive_signals.items.map((p, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#6ee7b7' }}>• {typeof p === 'string' ? p : (p.positive_factor || p.description || reportText(p))}</span>)}</div>)}
             </div>
           )}
           {aiResult.ai_summary && (<div style={{ background: '#1a1a2e', padding: '12px', borderRadius: '8px' }}><p style={{ fontSize: '11px', color: '#6366f1', marginBottom: '4px' }}>AI Summary:</p><p style={{ fontSize: '13px', color: '#e0e0e0', lineHeight: '1.5' }}>{aiResult.ai_summary}</p></div>)}
@@ -2045,6 +2093,8 @@ function EscalationForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, frustration_indicators: form.frustration_indicators.split(',').map(i => i.trim()).filter(i => i), agent_talking_points: form.agent_talking_points.split('\n').filter(p => p.trim()) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="EscalationForm" />
+      <FormattedAIReport response={form.ai_response} title="Escalation AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #ef4444, #f59e0b)' }}>{aiLoading ? <><span className="spinner" style={{ width: 16, height: 16, marginRight: 8 }}></span> Predicting Escalation...</> : '🚨 AI Predict Escalation'}</button>
       {aiResult && (
@@ -2136,6 +2186,8 @@ function ServiceLevelForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, bottleneck_factors: form.bottleneck_factors.split(',').map(i => i.trim()).filter(i => i), optimization_suggestions: form.optimization_suggestions.split(',').map(i => i.trim()).filter(i => i) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="ServiceLevelForm" />
+      <FormattedAIReport response={form.ai_response} title="ServiceLevel AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <button type="button" className="btn btn-primary" onClick={handleAI} disabled={aiLoading} style={{ marginBottom: '16px', background: 'linear-gradient(135deg, #3b82f6, #06b6d4)' }}>{aiLoading ? <><span className="spinner" style={{ width: 16, height: 16, marginRight: 8 }}></span> Predicting Service Level...</> : '⏱️ AI Predict Service Level'}</button>
       {aiResult && (
@@ -2165,8 +2217,8 @@ function ServiceLevelForm({ item, onSave, onCancel }) {
             <span style={{ ...aiResultStyles.chip, background: aiResult.agent_workload_impact === 'High' ? 'rgba(239, 68, 68, 0.2)' : aiResult.agent_workload_impact === 'Medium' ? 'rgba(245, 158, 11, 0.2)' : 'rgba(16, 185, 129, 0.2)', color: aiResult.agent_workload_impact === 'High' ? '#ef4444' : aiResult.agent_workload_impact === 'Medium' ? '#f59e0b' : '#10b981' }}>{aiResult.agent_workload_impact} Workload</span>
             <span style={{ ...aiResultStyles.chip, background: 'rgba(139, 92, 246, 0.2)', color: '#a78bfa' }}>Patience: {aiResult.customer_patience_index}</span>
           </div>
-          {aiResult.bottleneck_factors?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#f59e0b', marginBottom: '4px' }}>Bottleneck Factors:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.bottleneck_factors.map((f, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(245, 158, 11, 0.15)', color: '#fcd34d', fontSize: '10px' }}>{typeof f === 'object' ? JSON.stringify(f) : f}</span>)}</div></div>)}
-          {aiResult.optimization_suggestions?.length > 0 && (<div><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Optimization Suggestions:</p>{aiResult.optimization_suggestions.map((s, i) => <span key={i} style={{ display: 'block', fontSize: '12px', color: '#6ee7b7', marginBottom: '4px' }}>• {typeof s === 'object' ? JSON.stringify(s) : s}</span>)}</div>)}
+          {aiResult.bottleneck_factors?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#f59e0b', marginBottom: '4px' }}>Bottleneck Factors:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.bottleneck_factors.map((f, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(245, 158, 11, 0.15)', color: '#fcd34d', fontSize: '10px' }}>{typeof f === 'object' ? reportText(f) : f}</span>)}</div></div>)}
+          {aiResult.optimization_suggestions?.length > 0 && (<div><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Optimization Suggestions:</p>{aiResult.optimization_suggestions.map((s, i) => <span key={i} style={{ display: 'block', fontSize: '12px', color: '#6ee7b7', marginBottom: '4px' }}>• {typeof s === 'object' ? reportText(s) : s}</span>)}</div>)}
         </div>
       )}
       <div className="form-row">
@@ -2232,6 +2284,8 @@ function ResponseSuggestionForm({ item, onSave, onCancel }) {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSave({ ...form, key_points: form.key_points.split(',').map(i => i.trim()).filter(i => i), empathy_phrases: form.empathy_phrases.split(',').map(i => i.trim()).filter(i => i), solution_steps: form.solution_steps.split('\n').filter(s => s.trim()), knowledge_base_links: form.knowledge_base_links.split(',').map(i => i.trim()).filter(i => i) }); }}>
+      <AIPresetButtons form={form} setForm={setForm} formName="ResponseSuggestionForm" />
+      <FormattedAIReport response={form.ai_response} title="ResponseSuggestion AI analysis" />
       <div className="form-group"><label>Customer *</label><select value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} required><option value="">Select</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} ({c.company})</option>)}</select></div>
       <div className="form-group"><label>Ticket Subject</label><input value={form.ticket_subject} onChange={(e) => setForm({ ...form, ticket_subject: e.target.value })} placeholder="Enter support ticket subject" /></div>
       <div className="form-group"><label>Ticket Description</label><textarea value={form.ticket_description} onChange={(e) => setForm({ ...form, ticket_description: e.target.value })} rows={2} placeholder="Describe the customer's issue" /></div>
@@ -2252,14 +2306,14 @@ function ResponseSuggestionForm({ item, onSave, onCancel }) {
               <span style={{ fontSize: '14px', fontWeight: '600', color: aiResult.estimated_satisfaction > 80 ? '#10b981' : aiResult.estimated_satisfaction > 60 ? '#f59e0b' : '#ef4444' }}>{aiResult.estimated_satisfaction}%</span>
             </div>
           </div>
-          {aiResult.empathy_phrases?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#ec4899', marginBottom: '4px' }}>Empathy Phrases:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.empathy_phrases.map((p, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(236, 72, 153, 0.15)', color: '#f9a8d4', fontSize: '10px' }}>"{typeof p === 'object' ? JSON.stringify(p) : p}"</span>)}</div></div>)}
-          {aiResult.key_points?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#6366f1', marginBottom: '4px' }}>Key Points to Address:</p>{aiResult.key_points.map((p, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#a5b4fc', marginBottom: '2px' }}>• {typeof p === 'object' ? JSON.stringify(p) : p}</span>)}</div>)}
-          {aiResult.solution_steps?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Solution Steps:</p>{aiResult.solution_steps.map((s, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#6ee7b7', marginBottom: '2px' }}>{i + 1}. {typeof s === 'object' ? JSON.stringify(s) : s}</span>)}</div>)}
+          {aiResult.empathy_phrases?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#ec4899', marginBottom: '4px' }}>Empathy Phrases:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.empathy_phrases.map((p, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(236, 72, 153, 0.15)', color: '#f9a8d4', fontSize: '10px' }}>"{typeof p === 'object' ? reportText(p) : p}"</span>)}</div></div>)}
+          {aiResult.key_points?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#6366f1', marginBottom: '4px' }}>Key Points to Address:</p>{aiResult.key_points.map((p, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#a5b4fc', marginBottom: '2px' }}>• {typeof p === 'object' ? reportText(p) : p}</span>)}</div>)}
+          {aiResult.solution_steps?.length > 0 && (<div style={{ marginBottom: '12px' }}><p style={{ fontSize: '10px', color: '#10b981', marginBottom: '4px' }}>Solution Steps:</p>{aiResult.solution_steps.map((s, i) => <span key={i} style={{ display: 'block', fontSize: '11px', color: '#6ee7b7', marginBottom: '2px' }}>{i + 1}. {typeof s === 'object' ? reportText(s) : s}</span>)}</div>)}
           <div style={{ background: '#0f0f1a', padding: '16px', borderRadius: '12px', border: '1px solid #2d2d4a' }}>
             <p style={{ fontSize: '10px', color: '#9ca3af', marginBottom: '8px' }}>Suggested Response:</p>
             <p style={{ fontSize: '13px', color: '#e0e0e0', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>{aiResult.suggested_response}</p>
           </div>
-          {aiResult.knowledge_base_links?.length > 0 && (<div style={{ marginTop: '12px' }}><p style={{ fontSize: '10px', color: '#06b6d4', marginBottom: '4px' }}>Relevant Knowledge Base:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.knowledge_base_links.map((l, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(6, 182, 212, 0.15)', color: '#67e8f9', fontSize: '10px' }}>{typeof l === 'object' ? (l.title || l.url || JSON.stringify(l)) : l}</span>)}</div></div>)}
+          {aiResult.knowledge_base_links?.length > 0 && (<div style={{ marginTop: '12px' }}><p style={{ fontSize: '10px', color: '#06b6d4', marginBottom: '4px' }}>Relevant Knowledge Base:</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>{aiResult.knowledge_base_links.map((l, i) => <span key={i} style={{ ...aiResultStyles.chip, background: 'rgba(6, 182, 212, 0.15)', color: '#67e8f9', fontSize: '10px' }}>{typeof l === 'object' ? (l.title || l.url || reportText(l)) : l}</span>)}</div></div>)}
         </div>
       )}
       <div className="form-group"><label>Suggested Response</label><textarea value={form.suggested_response} onChange={(e) => setForm({ ...form, suggested_response: e.target.value })} rows={6} /></div>

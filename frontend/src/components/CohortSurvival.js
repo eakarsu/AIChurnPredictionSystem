@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import api from '../api';
 import { useToast } from './Toast';
+import FormattedAIReport, { reportText } from './FormattedAIReport';
 
 function CohortSurvival() {
   const [cohorts, setCohorts] = useState([]);
@@ -120,6 +121,8 @@ function CohortSurvival() {
       </div>
 
       {analysis && (
+        <>
+        <FormattedAIReport response={analysis} title="Cohort analysis" />
         <div className="card" style={{ padding: 24 }}>
           <h3 style={{ color: '#fff', marginTop: 0, marginBottom: 16 }}>🤖 AI Analysis</h3>
 
@@ -147,7 +150,7 @@ function CohortSurvival() {
             <div style={{ marginBottom: 20 }}>
               <h4 style={{ color: '#f59e0b', fontSize: 13, textTransform: 'uppercase', marginBottom: 8 }}>Churn Patterns</h4>
               {analysis.churn_patterns.map((p, i) => (
-                <div key={i} style={{ padding: 8, color: '#e0e0e0' }}>• {typeof p === 'string' ? p : (p.pattern || JSON.stringify(p))}</div>
+                <div key={i} style={{ padding: 8, color: '#e0e0e0' }}>• {typeof p === 'string' ? p : (p.pattern || reportText(p))}</div>
               ))}
             </div>
           )}
@@ -170,12 +173,13 @@ function CohortSurvival() {
               <h4 style={{ color: '#22d3ee', fontSize: 13, textTransform: 'uppercase', marginBottom: 8 }}>Key Insights</h4>
               <ul style={{ color: '#e0e0e0' }}>
                 {analysis.cohort_insights.map((insight, i) => (
-                  <li key={i} style={{ marginBottom: 6 }}>{typeof insight === 'string' ? insight : (insight.insight || JSON.stringify(insight))}</li>
+                  <li key={i} style={{ marginBottom: 6 }}>{typeof insight === 'string' ? insight : (insight.insight || reportText(insight))}</li>
                 ))}
               </ul>
             </div>
           )}
         </div>
+        </>
       )}
     </div>
   );

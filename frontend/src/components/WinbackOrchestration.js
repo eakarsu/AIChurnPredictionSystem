@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import api from '../api';
 import { useToast } from './Toast';
+import FormattedAIReport from './FormattedAIReport';
 
 function WinbackOrchestration() {
   const [timeSinceChurn, setTimeSinceChurn] = useState('30 days');
@@ -31,6 +32,7 @@ function WinbackOrchestration() {
 
       <div className="card" style={{ padding: 24, marginBottom: 24 }}>
         <h3 style={{ color: '#fff', marginTop: 0 }}>Configure Campaign</h3>
+        <div className="ai-preset-bar"><span>Sample timing</span><div style={{ display: 'flex', gap: 8 }}><button type="button" className="btn btn-secondary" onClick={() => setTimeSinceChurn('14 days')}>Recent churn</button><button type="button" className="btn btn-secondary" onClick={() => setTimeSinceChurn('90 days')}>Longer lapse</button></div></div>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginTop: 12 }}>
           <label style={{ color: '#9ca3af', fontSize: 14 }}>Time since churn:</label>
           <select value={timeSinceChurn} onChange={(e) => setTimeSinceChurn(e.target.value)} style={{ padding: 8, minWidth: 200 }}>
@@ -49,6 +51,7 @@ function WinbackOrchestration() {
 
       {campaign && (
         <>
+          <FormattedAIReport response={campaign} title="Win-back campaign" />
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px,1fr))', gap: 16, marginBottom: 24 }}>
             <div className="card" style={{ padding: 20 }}>
               <div style={{ fontSize: 12, color: '#9ca3af' }}>Customers Analyzed</div>
@@ -115,11 +118,7 @@ function WinbackOrchestration() {
           {campaign.campaign?.segmentation_strategy && (
             <div className="card" style={{ padding: 24, marginBottom: 24 }}>
               <h3 style={{ color: '#fff', marginTop: 0 }}>🎯 Segmentation Strategy</h3>
-              <p style={{ color: '#e0e0e0', whiteSpace: 'pre-wrap' }}>{
-                typeof campaign.campaign.segmentation_strategy === 'string'
-                  ? campaign.campaign.segmentation_strategy
-                  : JSON.stringify(campaign.campaign.segmentation_strategy, null, 2)
-              }</p>
+              <FormattedAIReport response={campaign.campaign.segmentation_strategy} title="Segmentation strategy" />
             </div>
           )}
 

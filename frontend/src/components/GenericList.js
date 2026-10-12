@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import FormattedAIReport from './FormattedAIReport';
 import { useToast } from './Toast';
 import api from '../api';
 import ConfirmDialog from './ConfirmDialog';
@@ -363,7 +364,9 @@ function GenericList({ title, apiEndpoint, columns, FormComponent, detailFields,
                   </td>
                   {columns.map((col) => (
                     <td key={col.key} onClick={() => handleRowClick(item)}>
-                      {col.render ? col.render(item[col.key], item) : item[col.key]}
+                      {/^(ai_analysis|ai_response|ai_suggestions)$/.test(col.key) && item[col.key] !== null && item[col.key] !== undefined
+                        ? <span>View formatted report in details</span>
+                        : col.render ? col.render(item[col.key], item) : item[col.key]}
                     </td>
                   ))}
                 </tr>
@@ -408,11 +411,16 @@ function GenericList({ title, apiEndpoint, columns, FormComponent, detailFields,
               {detailFields.map((field) => (
                 <div key={field.key} style={styles.detailRow}>
                   <span style={styles.detailLabel}>{field.label}:</span>
-                  <span style={styles.detailValue}>
-                    {field.render ? field.render(selectedItem[field.key], selectedItem) : (selectedItem[field.key] || 'N/A')}
-                  </span>
+                  <div style={styles.detailValue}>
+                    {/^(ai_analysis|ai_response|ai_suggestions)$/.test(field.key) && selectedItem[field.key] !== null && selectedItem[field.key] !== undefined
+                      ? <FormattedAIReport response={selectedItem[field.key]} title={field.label} />
+                      : field.render ? field.render(selectedItem[field.key], selectedItem) : (selectedItem[field.key] ?? 'N/A')}
+                  </div>
                 </div>
               ))}
+              {['ai_response', 'ai_analysis', 'ai_suggestions'].filter((key) =>
+                !detailFields.some((field) => field.key === key) && selectedItem[key] !== null && selectedItem[key] !== undefined
+              ).map((key) => <FormattedAIReport key={key} response={selectedItem[key]} title="Saved AI analysis" />)}
             </div>
             <div style={styles.detailActions}>
               <button className="btn btn-primary" onClick={() => handleEdit(selectedItem)}>Edit</button>
