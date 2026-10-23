@@ -488,6 +488,7 @@ app.put('/api/auth/profile', authenticateToken, [
 });
 
 // ============ CUSTOMERS ROUTES ============
+app.use('/api/feature-pack', require('./routes/featurePack')({ auth: authenticateToken, pool }));
 app.get('/api/customers', authenticateToken, async (req, res) => {
   try {
     if (req.query.page) {
